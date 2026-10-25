@@ -383,24 +383,104 @@ async def test_provenance_registry_and_configuration() -> None:
         assert {call.args[0] for call in runner.await_args_list} == {"synthid"}
 
 
-def test_provenance_merge_is_one_positive_signal_and_never_negative_evidence() -> None:
+def test_confirmed_provenance_overrides_models() -> None:
     remote = {
         "id": "synthid", "name": "OpenAI SynthID / C2PA", "status": "ok", "score": None,
         "verdict": "ai", "provenance": True, "detail": "Обнаружена водяная метка SynthID.",
+        "checks": [{"type": "synthid", "outcome": "detected"}],
     }
-    model = {"id": "local_frontier", "status": "ok", "score": 0.2, "verdict": "human"}
-    for findings in ([], [{"kind": "c2pa_generative", "level": "strong"}]):
-        merged = merge_service_results({"verdict": "clear", "findings": findings}, [model, remote])
+    models = [
+        {"id": "local_frontier", "status": "ok", "score": 0.01, "verdict": "human"},
+        {"id": "openai_vision", "status": "ok", "score": 0.18, "verdict": "human"},
+    ]
+    valid_c2pa = {"status": "valid", "signature_valid": True, "generative": True}
+    cases = [({"verdict": "clear"}, remote, "SynthID")]
+    cases.extend((
+        {"verdict": "clear"},
+        {**remote, "checks": [{"type": "c2pa", "outcome": "detected", "validation_state": state}]},
+        "C2PA (OpenAI)",
+    ) for state in ("trusted", "valid"))
+    cases.append(({"verdict": "clear", "forensics": {"c2pa": valid_c2pa}}, None, "C2PA"))
+    cases.append(({
+        "verdict": "clear", "forensics": {"c2pa": valid_c2pa},
+        "findings": [{"kind": "c2pa_generative", "level": "strong"}, {"kind": "generation_metadata", "level": "strong"}],
+    }, {**remote, "checks": remote["checks"] + [{"type": "c2pa", "outcome": "detected", "validation_state": "trusted"}]}, "SynthID"))
+    for local, provenance, source in cases:
+        results = deepcopy(models + ([provenance] if provenance else []))
+        expected_results = deepcopy(results)
+        merged = merge_service_results(deepcopy(local), results)
         probability = merged["generation_probability"]
-        assert probability["sources"] == 2
-        assert probability["percent"] == 60
-        assert merged["api_summary"]["checked"] == 2
-        assert merged["api_summary"]["ai_votes"] == 1
+        assert probability["decisive_source"] == source
+        assert probability["sources"] == 1
+        assert probability["percent"] == 99
+        assert probability["label"] == "Подтверждено происхождение"
+        assert "ненадёжен" not in probability["detail"]
+        assert merged["api_summary"]["score"] == 0.99
+        assert merged["verdict"] == "detected"
+        assert merged["headline"] == "Обнаружена метка " + source
+        assert merged["api_results"] == expected_results, "Individual model results remain available without changed scores"
         breakdown = {item["id"]: item for item in merged["probability_breakdown"]}
+        assert breakdown["model"]["percent"] == 1
+        assert breakdown["semantic"]["percent"] == 18
         assert breakdown["external"]["percent"] is None
         assert breakdown["external"]["source_count"] == 0
         assert breakdown["provenance"]["percent"] == 99
-        assert remote["detail"] in breakdown["provenance"]["detail"]
+    merged = merge_service_results({"verdict": "clear"}, [remote])
+    assert merged["generation_probability"]["percent"] == 99
+    assert merged["generation_probability"]["sources"] == 1
+
+
+def test_unconfirmed_provenance_never_overrides_or_lowers_models() -> None:
+    remote = {
+        "id": "synthid", "name": "OpenAI SynthID / C2PA", "status": "ok", "score": None,
+        "verdict": "ai", "provenance": True, "detail": "Результат проверки происхождения.",
+    }
+    models = [
+        {"id": "local_frontier", "status": "ok", "score": 0.01, "verdict": "human"},
+        {"id": "openai_vision", "status": "ok", "score": 0.18, "verdict": "human"},
+    ]
+    unconfirmed_remote = [
+        remote, {**remote, "checks": []},
+        {**remote, "verdict": "unknown", "checks": [{"type": "synthid", "outcome": "not_detected"}]},
+    ]
+    unconfirmed_remote.extend(
+        {**remote, "checks": [{"type": "c2pa", "outcome": "detected", "validation_state": state}]}
+        for state in ("untrusted", "invalid", None)
+    )
+    unconfirmed_remote.append({**remote, "checks": [{"type": "c2pa", "outcome": "not_detected", "validation_state": "trusted"}]})
+    unconfirmed_remote.extend(
+        {**remote, "status": status, "checks": [{"type": "synthid", "outcome": "detected"}]}
+        for status in ("error", "unavailable", "unsupported", "not_configured")
+    )
+    unconfirmed_local = [
+        {},
+        {"forensics": {"c2pa": {"status": "valid", "signature_valid": True, "generative": False}}},
+        {"forensics": {"c2pa": {"status": "valid", "generative": True}}},
+    ]
+    unconfirmed_local.extend(
+        {"forensics": {"c2pa": {"status": status, "signature_valid": signature, "generative": True}}}
+        for status, signature in (("valid", False), ("untrusted", True), ("invalid", False), ("error", True))
+    )
+    for local in unconfirmed_local:
+        local["verdict"] = "clear"
+        local["findings"] = [{"kind": "c2pa_generative", "level": "strong"}]
+    for local, provenance in [({"verdict": "clear"}, item) for item in unconfirmed_remote] + [(item, None) for item in unconfirmed_local]:
+        merged = merge_service_results(deepcopy(local), deepcopy(models + ([provenance] if provenance else [])))
+        probability = merged["generation_probability"]
+        assert probability["decisive_source"] is None
+        assert probability["percent"] == 10
+        assert probability["sources"] == 2
+
+    for kind in ("provider", "generation_metadata"):
+        merged = merge_service_results({"verdict": "clear", "findings": [{"kind": kind, "level": "strong"}]}, deepcopy(models))
+        assert merged["generation_probability"]["decisive_source"] is None
+        assert merged["generation_probability"]["percent"] == 38
+        assert merged["generation_probability"]["sources"] == 3
+
+    divergent = [models[0], {**models[1], "score": 0.95, "verdict": "ai"}]
+    merged = merge_service_results({"verdict": "clear"}, divergent)
+    assert merged["generation_probability"]["label"] == "Низкая согласованность"
+    assert merged["generation_probability"]["decisive_source"] is None
 
     negative = {**remote, "verdict": "unknown", "detail": "Водяные метки не обнаружены."}
     merged = merge_service_results({"verdict": "clear"}, [negative])
@@ -408,8 +488,8 @@ def test_provenance_merge_is_one_positive_signal_and_never_negative_evidence() -
     assert merged["generation_probability"]["sources"] == 0
     assert merged["api_summary"]["checked"] == 1
     assert merged["api_summary"]["ai_votes"] == 0
-    merged = merge_service_results({"verdict": "clear"}, [model, negative])
-    assert merged["generation_probability"]["percent"] == 20
+    merged = merge_service_results({"verdict": "clear"}, [models[0], negative])
+    assert merged["generation_probability"]["percent"] == 1
     assert merged["generation_probability"]["sources"] == 1
     for status in ("error", "unavailable", "unsupported", "not_configured"):
         skipped = {**remote, "status": status, "detail": f"Проверка: {status}"}
@@ -433,5 +513,6 @@ if __name__ == "__main__":
     asyncio.run(test_provenance_rejects_malformed_results())
     asyncio.run(test_provenance_http_failures_are_safe_and_not_retried())
     asyncio.run(test_provenance_registry_and_configuration())
-    test_provenance_merge_is_one_positive_signal_and_never_negative_evidence()
+    test_confirmed_provenance_overrides_models()
+    test_unconfirmed_provenance_never_overrides_or_lowers_models()
     print("service adapter and provenance tests passed")

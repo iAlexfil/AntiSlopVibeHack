@@ -260,7 +260,14 @@ def _snapshot(kind: str, result: dict[str, Any], images: list[bytes], created: f
         headline = label
         sections = _single_sections(result)
         summary = "Вероятность генерации или существенного изменения изображения генеративным ИИ."
-        if _dict(result.get("generation_probability")).get("label") == "Низкая согласованность":
+        probability = _dict(result.get("generation_probability"))
+        decisive_source = probability.get("decisive_source")
+        if decisive_source in {"SynthID", "C2PA (OpenAI)", "C2PA"}:
+            label, headline, tone = "Подтверждено происхождение", f"Обнаружена метка {decisive_source}", "high"
+            summary = f"Итог определён подтверждённым источником {decisive_source}. Оценки моделей показаны отдельно."
+            sections.insert(0, _section("Подтверждённое происхождение", [
+                _item("Метка", decisive_source, "Подтверждённая метка определяет итог независимо от вероятностных оценок моделей.")]))
+        elif probability.get("label") == "Низкая согласованность":
             label, headline, tone = "Низкая согласованность", "Детекторы сильно расходятся", "mid"
             summary = "Детекторы сильно расходятся — итоговый процент ненадёжен."
             sections.insert(0, _section("Согласованность источников", [

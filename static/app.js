@@ -603,14 +603,14 @@ function clearReport() {
   results.hidden = true;
   $('#visualAnalysis').hidden = true;
   $('#reportDetails').open = false;
-  ['#breakdownGrid', '#findings', '#fileFacts', '#metadata', '#apiResults', '#forensicSignals', '#forensicMaps', '#c2paResult', '#exifChecks', '#hashes'].forEach((selector) => {
+  ['#breakdownGrid', '#findings', '#fileFacts', '#metadata', '#apiResults', '#inactiveDetectors', '#provenanceChecks', '#forensicSignals', '#forensicMaps', '#c2paResult', '#exifChecks', '#hashes'].forEach((selector) => {
     $(selector)?.replaceChildren();
   });
   ['#resourceBudget', '#apiConsensus', '#scoreBasis', '#resultSources', '#resultHeadline', '#resultSummary', '#resultLabel'].forEach((selector) => setText(selector, ''));
   setText('#probabilityValue', '—');
   $('#probabilityFill').style.width = '0%';
   if ($('#probabilityMarker')) $('#probabilityMarker').hidden = true;
-  $('#scoreCard').classList.remove('high', 'mid', 'low', 'preview-unavailable');
+  $('#scoreCard').classList.remove('high', 'mid', 'low', 'conflict', 'preview-unavailable');
   $('#scoreCard').classList.add('unknown');
   $('#resultPreview').removeAttribute('src');
 }
@@ -746,9 +746,11 @@ function renderOverall(data) {
   const probability = data.generation_probability || {};
   const value = probability.percent;
   const numeric = Number.isFinite(value);
-  const tone = !numeric ? 'unknown' : value >= 65 ? 'high' : value <= 35 ? 'low' : 'mid';
+  const decisive = probability.decisive_source;
+  const disagreement = !decisive && probability.label === 'Низкая согласованность';
+  const tone = !numeric ? 'unknown' : disagreement ? 'conflict' : value >= 65 ? 'high' : value <= 35 ? 'low' : 'mid';
   const card = $('#scoreCard');
-  card.classList.remove('unknown', 'high', 'low', 'mid');
+  card.classList.remove('unknown', 'high', 'low', 'mid', 'conflict');
   card.classList.add(tone);
   card.classList.toggle('preview-unavailable', !previewAvailable);
   const resultImage = $('#resultPreview');
@@ -763,11 +765,12 @@ function renderOverall(data) {
     marker.style.left = numeric ? `${Math.max(0, Math.min(100, value))}%` : '0%';
   }
   setText('#resultEyebrow', 'Результат анализа');
-  $('#resultLabel').textContent = !numeric ? 'Недостаточно данных' : value >= 65 ? 'Высокая вероятность ИИ' : value <= 35 ? 'Низкая вероятность ИИ' : 'Неоднозначный результат';
-  const disagreement = probability.label === 'Низкая согласованность';
+  $('#resultLabel').textContent = !numeric ? 'Недостаточно данных' : decisive ? 'Подтверждённый признак происхождения' : disagreement ? 'Низкая согласованность' : value >= 65 ? 'Высокая вероятность ИИ' : value <= 35 ? 'Низкая вероятность ИИ' : 'Неоднозначный результат';
   $('#resultHeadline').textContent = !numeric
-    ? 'Не удалось получить оценку'
-    : disagreement
+    ? 'Недостаточно данных'
+    : decisive
+      ? `Обнаружена метка ${decisive}`
+      : disagreement
       ? 'Источники расходятся во мнениях'
       : value >= 65
         ? 'Есть признаки генерации ИИ'
@@ -776,7 +779,9 @@ function renderOverall(data) {
           : 'Однозначного ответа пока нет';
   $('#resultSummary').textContent = !numeric
     ? 'Модели не ответили. Попробуйте проверить изображение ещё раз.'
-    : disagreement
+    : decisive
+      ? 'Подтверждённый признак происхождения определяет итоговую оценку.'
+      : disagreement
       ? 'Источники расходятся — посмотрите разбивку ниже.'
       : value >= 65
         ? 'Найдены признаки генерации или обработки изображения нейросетью.'
@@ -789,7 +794,7 @@ function renderOverall(data) {
   const sources = [modelAnswers ? `${plural(modelAnswers, 'Ответила', 'Ответили', 'Ответили')} ${modelAnswers} ${plural(modelAnswers, 'модель', 'модели', 'моделей')}` : 'Нет ответивших моделей'];
   if (provenanceChecks) sources.push(provenanceChecks === 1 ? 'Проверка происхождения выполнена' : `Проверок происхождения выполнено: ${provenanceChecks}`);
   if (Number.isFinite(probability.sources) && probability.sources > modelAnswers) sources.push('учтён сигнал происхождения');
-  if (numeric && probability.label) sources.push(probability.label === 'Один модельный сигнал' && modelAnswers === 0 ? 'Один сигнал происхождения' : probability.label);
+  if (numeric && probability.label && !(decisive && probability.label === 'Низкая согласованность')) sources.push(probability.label === 'Один модельный сигнал' && modelAnswers === 0 ? 'Один сигнал происхождения' : probability.label);
   setText('#resultSources', sources.join(' · '));
   $('#scoreBasis').textContent = probability.detail || 'Источники оценки отсутствуют.';
 }
@@ -806,6 +811,8 @@ function missingMetricState(item, data) {
     const providers = providerResults.filter((entry) => item.id === 'semantic' ? entry.id === 'openai_vision' : !entry.provenance && entry.id !== 'synthid' && entry.id !== 'local_frontier' && entry.id !== 'openai_vision');
     if (providers.some((entry) => entry.status === 'error')) return { label: 'Нет ответа', note: 'Сервис не смог завершить проверку. Подробности — в отчёте.' };
     if (providers.some((entry) => entry.status === 'ok')) return { label: 'Нет оценки', note: 'Сервис ответил, но не смог определить вероятность.' };
+    if (providers.some((entry) => entry.status === 'unsupported')) return { label: 'Формат не поддержан', note: 'Этот сервис не поддерживает формат выбранного изображения.' };
+    if (providers.some((entry) => entry.status === 'unavailable')) return { label: 'Недоступен', note: 'Сервис недоступен для этой проверки.' };
     return { label: item.id === 'external' ? 'Не подключены' : 'Не подключён', note: item.id === 'external' ? 'Специализированные детекторы не подключены на сервере.' : 'Сервис смыслового анализа не подключён на сервере.' };
   }
   return { label: 'Нет данных', note: item.detail || 'Этот сигнал не удалось рассчитать.' };
@@ -835,6 +842,40 @@ function renderBreakdown(data) {
     card.querySelector('.metric-bar span').style.width = numeric ? `${Math.max(0, Math.min(100, item.percent))}%` : '0%';
     root.append(card);
   });
+  renderProvenance(data);
+}
+
+function appendCheck(root, title, result, status = '') {
+  const card = document.createElement('article');
+  card.className = `method-check ${status}`;
+  card.innerHTML = '<h3></h3><strong></strong>';
+  card.querySelector('h3').textContent = title;
+  card.querySelector('strong').textContent = result;
+  root.append(card);
+  return card;
+}
+
+function renderProvenance(data) {
+  const root = $('#provenanceChecks');
+  root.replaceChildren();
+  const c2pa = data.forensics?.c2pa;
+  const labels = {valid: 'Подпись проверена', none: 'Подпись не найдена', untrusted: 'Источник подписи не подтверждён', invalid: 'Подпись не прошла проверку', present: 'Подпись не подтверждена', error: 'Ошибка проверки', unavailable: 'Проверка недоступна'};
+  const local = appendCheck(root, 'C2PA в файле', labels[c2pa?.status] || 'Нет результата', c2pa?.status);
+  if (c2pa?.found) appendDetail(local, 'ИИ в манифесте', c2pa.generative ? 'Указан' : 'Не указан');
+  if (c2pa?.generator) appendDetail(local, 'Приложение', c2pa.generator);
+  const provider = asArray(data.api_results).find((item) => item.id === 'synthid');
+  const unavailable = !provider ? 'Выключено' : {error: 'Ошибка сервиса', not_configured: 'Не подключено', unavailable: 'Недоступно', unsupported: 'Формат не поддерживается'}[provider.status] || 'Нет результата';
+  for (const [type, title] of [['synthid', 'SynthID через OpenAI'], ['c2pa', 'C2PA через OpenAI']]) {
+    const check = provider?.status === 'ok' ? asArray(provider.checks).find((item) => item.type === type) : null;
+    const detected = check?.outcome === 'detected';
+    const label = !check ? unavailable : check.validation_state === 'invalid' ? 'Подпись не прошла проверку' : detected ? 'Метка найдена' : 'Метка не найдена';
+    const card = appendCheck(root, title, label, check?.validation_state === 'invalid' ? 'invalid' : detected ? 'detected' : provider?.status || 'off');
+    if (detected && check.validation_state) appendDetail(card, 'Подпись', {trusted: 'Доверенная', valid: 'Проверена'}[check.validation_state] || 'Доверие не подтверждено');
+    for (const [key, name] of [['issuer', 'Издатель'], ['model', 'Модель генерации'], ['generated_at', 'Дата генерации']]) {
+      if (check?.[key]) appendDetail(card, name, check[key]);
+    }
+  }
+  if (provider && ['error', 'unsupported'].includes(provider.status) && provider.detail) appendDetail(root, 'OpenAI', provider.detail);
 }
 
 function renderFileReport(data) {
@@ -877,8 +918,11 @@ function renderFileReport(data) {
 
 function renderApiResults(data) {
   const root = $('#apiResults');
-  const items = asArray(data.api_results);
+  const allItems = asArray(data.api_results);
+  const items = allItems.filter((item) => !['openai_vision', 'synthid'].includes(item.id) && !item.provenance);
+  const inactive = $('#inactiveDetectors');
   root.replaceChildren();
+  inactive.replaceChildren();
   const checked = Number.isFinite(data.api_summary?.checked) ? data.api_summary.checked : items.filter((item) => item.status === 'ok').length;
   $('#apiConsensus').textContent = checked ? `${checked} ${plural(checked, 'источник ответил', 'источника ответили', 'источников ответили')}` : 'Ответов источников нет';
   if (!items.length) {
@@ -888,6 +932,17 @@ function renderApiResults(data) {
     root.append(empty);
   }
   items.forEach((item) => {
+    const missing = {error: 'Ошибка', unavailable: 'Недоступен', unsupported: 'Формат не поддержан', not_configured: 'Не подключён'}[item.status] || 'Нет оценки';
+    if (item.id !== 'local_frontier' && ['not_configured', 'unavailable'].includes(item.status)) {
+      const row = document.createElement('details');
+      row.innerHTML = '<summary></summary><p></p>';
+      row.querySelector('summary').textContent = `${item.name || 'Детектор'}: ${missing}`;
+      row.querySelector('p').textContent = item.detail || 'Не участвовал в итоговой оценке.';
+      inactive.append(row);
+      return;
+    }
+    const numeric = item.status === 'ok' && item.verdict !== 'unknown' && Number.isFinite(item.score);
+    const percent = numeric ? Math.max(1, Math.min(99, Math.round(item.score * 100))) : null;
     const card = document.createElement('article');
     card.className = `api-result ${item.status || 'unknown'} ${item.verdict || ''}`;
     if (item.provenance) card.classList.add('provenance');
@@ -898,10 +953,19 @@ function renderApiResults(data) {
     card.innerHTML = '<div class="api-result-top"><h4></h4><span class="status"></span></div><div class="api-score"></div><p></p>';
     card.querySelector('h4').textContent = item.name || 'Источник сигнала';
     card.querySelector('.status').textContent = label;
-    card.querySelector('.api-score').textContent = item.provenance && item.status === 'ok'
-      ? item.verdict === 'ai' ? 'Признак найден' : 'Не обнаружено'
-      : item.status === 'ok' && Number.isFinite(item.score) ? `${Math.round(item.score * 100)}%` : '—';
-    card.querySelector('p').textContent = item.status === 'not_configured' ? 'Этот сервис не подключён на сервере.' : item.detail || '';
+    card.querySelector('.api-score').textContent = numeric ? `${percent}%` : missing;
+    card.querySelector('p').textContent = item.status === 'ok' ? '' : item.detail || '';
+    card.querySelector('p').hidden = item.status === 'ok';
+    if (item.status === 'ok') {
+      const details = document.createElement('details');
+      details.className = 'method-details';
+      details.innerHTML = '<summary>Данные модели</summary>';
+      if (item.id === 'local_frontier') appendDetail(details, 'Модель', item.name || 'Локальная модель');
+      else if (item.detail) appendDetail(details, 'Ответ', item.detail);
+      if (Number.isFinite(item.latency_ms)) appendDetail(details, 'Время проверки', `${(item.latency_ms / 1000).toFixed(1)} с`);
+      if (item.generator) appendDetail(details, 'Предполагаемый генератор', item.generator);
+      card.append(details);
+    }
     asArray(item.checks).forEach((check) => {
       const checkRoot = document.createElement('div');
       checkRoot.className = 'provenance-check';
@@ -925,6 +989,7 @@ function renderApiResults(data) {
     }
     root.append(card);
   });
+  if (!allItems.some((item) => item.id !== 'local_frontier')) inactive.textContent = 'Внешние детекторы выключены.';
 }
 
 function appendDetail(root, label, value) {
@@ -937,64 +1002,103 @@ function appendDetail(root, label, value) {
 }
 
 function renderVision(data) {
-  const result = asArray(data.api_results).find((item) => item.id === 'openai_vision' && item.status === 'ok' && item.analysis);
+  const provider = asArray(data.api_results).find((item) => item.id === 'openai_vision');
+  const analysis = provider?.status === 'ok' ? provider.analysis : null;
+  const observations = asArray(analysis?.signals);
   const root = $('#visualAnalysis');
-  root.hidden = !result;
-  if (!result) return;
-  const analysis = result.analysis;
-  $('#visionExplanation').textContent = analysis.explanation || '';
-  $('#visionJson').textContent = JSON.stringify(analysis, null, 2);
+  root.hidden = false;
+  $('#visionHeading').textContent = analysis ? analysis.assessment === 'insufficient_detail' ? 'Недостаточно деталей' : observations.length ? 'Наблюдения' : 'Ничего не выделено'
+    : !provider ? 'Выключен' : {error: 'Ошибка', unsupported: 'Формат не поддерживается', unavailable: 'Недоступен', not_configured: 'Не подключён'}[provider.status] || 'Нет результата';
+  $('#visionExplanation').textContent = analysis?.explanation || '';
+  $('#visionExplanation').hidden = !analysis?.explanation;
+  $('#visionJsonSection').hidden = !analysis;
+  $('#visionJsonSection').open = false;
+  $('#visionJson').textContent = analysis ? JSON.stringify(analysis, null, 2) : '';
+  $('#visionResponseDetails').hidden = !provider?.detail || provider.status === 'ok';
+  $('#visionResponseDetails').open = false;
+  $('#visionResponseText').textContent = provider?.status !== 'ok' ? provider?.detail || '' : '';
+  $('#signalCount').hidden = !observations.length;
+  $('#signalCount').textContent = observations.length;
+  $('#visionNote').hidden = !observations.length;
   const image = $('#visionPreview');
-  $('#visionImageFrame').hidden = !(previewAvailable && previewUrl);
+  $('#visionImageFrame').hidden = !(analysis && previewAvailable && previewUrl);
   image.onload = () => {
     $('#visionImageFrame').style.width = `${Math.min(640, 480 * image.naturalWidth / image.naturalHeight)}px`;
   };
-  if (previewAvailable && previewUrl) image.src = previewUrl;
+  if (analysis && previewAvailable && previewUrl) image.src = previewUrl;
+  else image.removeAttribute('src');
   const regions = $('#visionRegions');
   const signals = $('#visionSignals');
   regions.replaceChildren();
   signals.replaceChildren();
-  const select = (index) => {
+  const regionCount = observations.filter((signal) => signal.region).length;
+  $('#regionHint').textContent = regionCount ? 'Рамки приблизительные' : '';
+  $('#regionHint').hidden = !regionCount;
+  $('#regionSelection').textContent = '';
+  $('#regionSelection').hidden = !observations.length;
+  const select = (index, fromImage = false, shouldScroll = true) => {
     root.querySelectorAll('[data-signal]').forEach((element) => {
       const active = element.dataset.signal === String(index);
       element.classList.toggle('active', active);
       if (element.tagName === 'BUTTON') element.setAttribute('aria-pressed', String(active));
     });
+    const signal = observations[index];
+    $('#regionSelection').textContent = `${index + 1}. ${signal.observation}`;
+    if (!shouldScroll) return;
+    if (fromImage) signals.children[index]?.scrollIntoView({behavior: motionBehavior(), block: 'nearest'});
+    else if (!$('#visionImageFrame').hidden && window.matchMedia('(max-width: 760px)').matches) $('#visionImageFrame').scrollIntoView({behavior: motionBehavior(), block: 'center'});
   };
   const strength = { weak: 'слабый', moderate: 'средний', strong: 'сильный' };
-  asArray(analysis.signals).forEach((signal, index) => {
+  observations.forEach((signal, index) => {
     const card = document.createElement('article');
     card.className = 'vision-signal';
     card.dataset.signal = index;
     const button = document.createElement('button');
     button.type = 'button';
-    button.textContent = `${index + 1}. ${signal.observation}`;
     button.dataset.signal = index;
     button.setAttribute('aria-pressed', 'false');
+    button.setAttribute('aria-controls', 'visionImageFrame');
+    const number = document.createElement('span');
+    number.className = 'signal-number';
+    number.textContent = index + 1;
+    const title = document.createElement('span');
+    title.textContent = signal.observation;
+    button.append(number, title);
     button.addEventListener('click', () => select(index));
     card.append(button);
     appendDetail(card, 'Сигнал', strength[signal.strength] || signal.strength);
     appendDetail(card, 'Объяснение', signal.explanation);
-    appendDetail(card, 'Другая возможная причина', signal.alternative_explanation);
+    const alternative = document.createElement('details');
+    alternative.className = 'signal-alternative';
+    const summary = document.createElement('summary');
+    summary.textContent = 'Другая возможная причина';
+    const alternativeText = document.createElement('p');
+    alternativeText.textContent = signal.alternative_explanation || '';
+    alternative.append(summary, alternativeText);
+    card.append(alternative);
     signals.append(card);
     if (signal.region) {
       const box = document.createElement('button');
       box.type = 'button';
       box.className = 'vision-region';
       box.dataset.signal = index;
-      box.textContent = index + 1;
-      box.setAttribute('aria-label', `Признак ${index + 1}: ${signal.observation}`);
+      const marker = document.createElement('span');
+      marker.textContent = index + 1;
+      box.append(marker);
+      box.setAttribute('aria-label', `Область ${index + 1}: ${signal.observation}`);
       box.setAttribute('aria-pressed', 'false');
       const { x1, y1, x2, y2 } = signal.region;
       Object.assign(box.style, { left: `${x1 * 100}%`, top: `${y1 * 100}%`, width: `${(x2 - x1) * 100}%`, height: `${(y2 - y1) * 100}%` });
-      box.addEventListener('click', () => select(index));
+      box.addEventListener('click', () => select(index, true));
       regions.append(box);
     }
   });
-  if (!asArray(analysis.signals).length) signals.textContent = 'Явных визуальных признаков не найдено. Это не подтверждает подлинность.';
+  if (observations.length) select(0, false, false);
   const limitations = $('#visionLimitations');
   limitations.replaceChildren();
-  asArray(analysis.limitations).forEach((text) => {
+  $('#visionLimitsDetails').hidden = !asArray(analysis?.limitations).length;
+  $('#visionLimitsDetails').open = false;
+  asArray(analysis?.limitations).forEach((text) => {
     const item = document.createElement('li');
     item.textContent = text;
     limitations.append(item);
@@ -1004,6 +1108,7 @@ function renderVision(data) {
 function renderForensics(data) {
   ['#forensicSignals', '#forensicMaps', '#c2paResult', '#exifChecks', '#hashes'].forEach((selector) => $(selector).replaceChildren());
   setText('#resourceBudget', '');
+  setText('#pixelSummary', 'Нет результата');
   const report = data.forensics;
   if (!report) {
     setText('#forensicSignals', 'Пиксельный анализ недоступен для этой проверки.');
@@ -1017,12 +1122,15 @@ function renderForensics(data) {
   if (Number.isFinite(budget.max_fft_edge)) budgetParts.push(`FFT ≤ ${budget.max_fft_edge}px`);
   if (ml?.status === 'ok' && Number.isFinite(ml.peak_rss_mb)) budgetParts.push(`Модель: ${ml.peak_rss_mb} МБ памяти`);
   $('#resourceBudget').textContent = budgetParts.join(' · ');
+  const applicable = asArray(report.signals).filter((signal) => ['normal', 'review'].includes(signal.status));
+  setText('#pixelSummary', applicable.length ? `Отклонения: ${applicable.filter((signal) => signal.status === 'review').length} из ${applicable.length}` : 'Нет результата');
   const signals = $('#forensicSignals');
   asArray(report.signals).forEach((signal) => {
     const card = document.createElement('article');
     card.className = `forensic-signal ${signal.status || ''}`;
-    card.innerHTML = '<div class="forensic-signal-top"><b></b><span class="lamp"></span></div><div class="forensic-value"></div><small></small><p></p>';
+    card.innerHTML = '<div class="forensic-signal-top"><b></b><span class="lamp"></span></div><strong class="forensic-status"></strong><div class="forensic-value"></div><small></small><p></p>';
     card.querySelector('b').textContent = signal.name || '';
+    card.querySelector('.forensic-status').textContent = {normal: 'Без отклонений', review: 'Есть отклонения', not_applicable: 'Не применимо', error: 'Ошибка проверки', unavailable: 'Недоступно'}[signal.status] || 'Нет результата';
     card.querySelector('.forensic-value').textContent = signal.value ?? '—';
     card.querySelector('small').textContent = signal.unit || '';
     card.querySelector('p').textContent = signal.detail || '';
@@ -1037,7 +1145,8 @@ function renderForensics(data) {
     image.alt = `Диагностическая карта: ${map.name || ''}`;
     image.loading = 'lazy';
     const label = document.createElement('figcaption');
-    label.textContent = map.name || '';
+    const explanations = {ela: 'Разница после повторного JPEG-сжатия.', noise: 'Мелкие детали и шумовой остаток.', frequency: 'Спектр частот, не координаты объектов.', repetition: 'Блоки с похожей текстурой.'};
+    label.textContent = [map.name, explanations[map.id]].filter(Boolean).join(' · ');
     card.append(image, label);
     maps.append(card);
   });
@@ -1050,8 +1159,9 @@ function renderForensics(data) {
   c2pa.append(badge);
   if (credentials.detail) appendDetail(c2pa, 'Результат', credentials.detail);
   if (credentials.generator) appendDetail(c2pa, 'Приложение-источник', credentials.generator);
+  if (asArray(credentials.validation_codes).length) appendDetail(c2pa, 'Коды проверки', credentials.validation_codes.join(', '));
   const exif = $('#exifChecks');
-  asArray(report.exif_checks).forEach((check) => appendDetail(exif, check.name, check.detail));
+  asArray(report.exif_checks).forEach((check) => appendDetail(exif, check.name === 'Software' ? 'Редактор' : check.name, check.name === 'Камера' && check.status === 'absent' ? 'Нет данных' : check.detail));
   if (!exif.childElementCount) exif.textContent = 'Проверяемые EXIF-данные отсутствуют.';
   const hashes = $('#hashes');
   Object.entries(report.hashes || {}).forEach(([name, value]) => appendDetail(hashes, name, value));

@@ -252,10 +252,17 @@ def analyze_image(data: bytes, filename: str) -> dict[str, Any]:
             "detail": "В контейнере есть признаки манифеста происхождения: " + ", ".join(credential_hits), "weight": 3,
         })
     c2pa_result = forensics["c2pa"]
-    if c2pa_result.get("generative"):
+    if (c2pa_result.get("generative") is True
+            and c2pa_result.get("status") == "valid"
+            and c2pa_result.get("signature_valid") is True):
         findings.append({
             "kind": "c2pa_generative", "level": "strong", "title": "C2PA указывает на генеративный источник",
             "detail": "Подписанный манифест содержит тип источника trained algorithmic media.", "weight": 70,
+        })
+    elif c2pa_result.get("generative") is True:
+        findings.append({
+            "kind": "c2pa_invalid", "level": "weak", "title": "Генеративный C2PA не подтверждён",
+            "detail": "Манифест указывает на генерацию, но проверка подписи не подтвердила происхождение.", "weight": 10,
         })
     elif c2pa_result.get("status") == "invalid":
         findings.append({

@@ -446,21 +446,33 @@ async def analyze_with_services(data: bytes, filename: str, mime_type: str) -> l
     return results
 
 
+def _confirmed_provenance(local: dict[str, Any], results: list[ProviderResult]) -> str | None:
+    remote = next((item for item in results if item.get("id") == "synthid" and item.get("status") == "ok"), None)
+    checks = remote.get("checks", []) if remote else []
+    if any(check.get("type") == "synthid" and check.get("outcome") == "detected" for check in checks):
+        return "SynthID"
+    if any(check.get("type") == "c2pa" and check.get("outcome") == "detected"
+           and check.get("validation_state") in {"trusted", "valid"} for check in checks):
+        return "C2PA (OpenAI)"
+    c2pa = (local.get("forensics") or {}).get("c2pa") or {}
+    if c2pa.get("status") == "valid" and c2pa.get("signature_valid") is True and c2pa.get("generative") is True:
+        return "C2PA"
+    return None
+
+
 def merge_service_results(local: dict[str, Any], api_results: list[ProviderResult]) -> dict[str, Any]:
     completed = [item for item in api_results if item.get("status") == "ok"]
-    successful = [item for item in completed if not item.get("provenance") and item.get("verdict") != "unknown"]
+    successful = [item for item in completed if item.get("id") != "synthid" and not item.get("provenance") and item.get("verdict") != "unknown"]
     failed = [item for item in api_results if item.get("status") == "error"]
-    remote_provenance = next((item for item in completed if item.get("provenance") and item.get("verdict") == "ai"), None)
+    decisive_source = _confirmed_provenance(local, api_results)
     scores = [float(item["score"]) for item in successful]
     provenance_score: float | None = None
     finding_kinds = {item.get("kind") for item in local.get("findings", []) if item.get("level") == "strong"}
-    if "c2pa_generative" in finding_kinds or remote_provenance:
-        provenance_score = 0.99
-    elif finding_kinds & {"provider", "generation_metadata"}:
+    if finding_kinds & {"provider", "generation_metadata"}:
         provenance_score = 0.95
 
-    probability_inputs = list(scores)
-    if provenance_score is not None:
+    probability_inputs = [0.99] if decisive_source else list(scores)
+    if not decisive_source and provenance_score is not None:
         probability_inputs.append(provenance_score)
     consensus = sum(probability_inputs) / len(probability_inputs) if probability_inputs else None
     ai_votes = sum(score >= 0.5 for score in scores)
@@ -475,7 +487,7 @@ def merge_service_results(local: dict[str, Any], api_results: list[ProviderResul
 
     source_names = [str(item.get("name", "детектор")) for item in successful]
     if provenance_score is not None:
-        source_names.append(str(remote_provenance["name"]) if remote_provenance else "метаданные происхождения")
+        source_names.append("метаданные происхождения")
     if consensus is None:
         percent = None
         probability_label = "Недостаточно данных"
@@ -484,19 +496,21 @@ def merge_service_results(local: dict[str, Any], api_results: list[ProviderResul
         # Не показываем абсолютные 0/100: любой детектор допускает ошибки и стареет.
         percent = max(1, min(99, round(consensus * 100)))
         spread = max(probability_inputs) - min(probability_inputs) if len(probability_inputs) > 1 else 0
-        if spread >= 0.45:
+        if decisive_source:
+            probability_label = "Подтверждено происхождение"
+        elif spread >= 0.45:
             probability_label = "Низкая согласованность"
         elif len(probability_inputs) == 1:
             probability_label = "Один источник оценки"
         else:
             probability_label = "Сводная оценка"
-        probability_detail = "Основание: " + ", ".join(source_names)
+        probability_detail = f"Основание: {decisive_source}. Оценки моделей не влияют на итог." if decisive_source else "Основание: " + ", ".join(source_names)
         if spread >= 0.45:
             probability_detail += ". Детекторы сильно расходятся — процент ненадёжен."
 
-        if local["verdict"] == "detected" or remote_provenance or ai_votes > len(scores) / 2 or consensus >= 0.65:
+        if local["verdict"] == "detected" or decisive_source or ai_votes > len(scores) / 2 or consensus >= 0.65:
             local["verdict"] = "detected"
-            local["headline"] = "Есть признаки AI‑происхождения"
+            local["headline"] = f"Обнаружена метка {decisive_source}" if decisive_source else "Есть признаки AI‑происхождения"
         elif ai_votes == 0 and consensus <= 0.35:
             local["verdict"] = "clear"
             local["headline"] = "Скорее не сгенерировано"
@@ -509,6 +523,7 @@ def merge_service_results(local: dict[str, Any], api_results: list[ProviderResul
         "label": probability_label,
         "detail": probability_detail,
         "sources": len(probability_inputs),
+        "decisive_source": decisive_source,
     }
     local["probability_breakdown"] = _probability_breakdown(local, api_results)
     return local
@@ -525,20 +540,21 @@ def _probability_breakdown(local: dict[str, Any], results: list[ProviderResult])
     semantic = next((item for item in successful if item.get("id") == "openai_vision"), None)
     external = [
         item for item in successful
-        if item.get("id") not in {"local_frontier", "openai_vision"} and not item.get("provenance") and item.get("verdict") != "unknown"
+        if item.get("id") not in {"local_frontier", "openai_vision", "synthid"} and not item.get("provenance") and item.get("verdict") != "unknown"
     ]
 
     finding_kinds = {str(item.get("kind")) for item in local.get("findings", [])}
-    if "c2pa_generative" in finding_kinds:
+    confirmed = _confirmed_provenance(local, results)
+    if confirmed:
         provenance = 99
-        provenance_detail = "Подписанный C2PA-манифест указывает на генеративный источник."
+        provenance_detail = f"Подтверждено происхождение: {confirmed}."
     elif finding_kinds & {"provider", "generation_metadata"}:
         provenance = 95
         provenance_detail = "В файле найдены сигнатуры генератора или параметры генерации."
     elif "corner" in finding_kinds:
         provenance = 40
         provenance_detail = "Эвристика заметила возможный бейдж в углу; нужна ручная проверка."
-    elif finding_kinds & {"credentials", "c2pa_invalid"}:
+    elif finding_kinds & {"credentials", "c2pa_invalid", "c2pa_generative"}:
         provenance = 20
         provenance_detail = "Следы происхождения есть, но они не подтверждают генерацию."
     else:
@@ -547,7 +563,7 @@ def _probability_breakdown(local: dict[str, Any], results: list[ProviderResult])
 
     remote_provenance = next((item for item in results if item.get("id") == "synthid"), None)
     if remote_provenance:
-        if remote_provenance.get("status") == "ok" and remote_provenance.get("verdict") == "ai":
+        if _confirmed_provenance({}, [remote_provenance]):
             provenance = 99
             provenance_detail = remote_provenance["detail"]
         else:

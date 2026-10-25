@@ -8,8 +8,8 @@
   <title>AntiSlop — фото или нейросеть?</title>
   <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
   <link rel="preload" href="/static/fonts/unbounded-cyrillic.woff2" as="font" type="font/woff2" crossorigin>
-  <link rel="stylesheet" href="/static/app.css?v=15">
-  <script src="/static/effects.js?v=15" defer></script>
+  <link rel="stylesheet" href="/static/app.css?v=16">
+  <script src="/static/effects.js?v=16" defer></script>
 </head>
 <body data-state="idle">
   <svg class="icon-definitions" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
@@ -101,22 +101,26 @@
         <div class="score-scale"><div class="score-line"><span id="probabilityFill"></span><i id="probabilityMarker" aria-hidden="true"></i></div><div class="scale-labels"><span>Меньше признаков ИИ</span><span>Больше признаков ИИ</span></div></div>
       </article>
       <section class="breakdown" aria-labelledby="breakdownTitle"><div class="breakdown-heading"><h3 id="breakdownTitle">Что показала проверка</h3></div><div id="breakdownGrid"></div></section>
+      <section id="modelAnalysis" class="method-section" aria-labelledby="modelsTitle"><div class="report-heading"><h3 id="modelsTitle">Модели и детекторы</h3><span id="apiConsensus"></span></div><div id="apiResults" class="api-results"></div><div id="inactiveDetectors" class="inactive-detectors"></div></section>
+      <section id="provenanceAnalysis" class="method-section" aria-labelledby="provenanceTitle"><div class="report-heading"><h3 id="provenanceTitle">Метки и происхождение</h3></div><div id="provenanceChecks" class="provenance-checks"></div><div class="provenance-evidence"><section><h4>Сигнатуры и метаданные</h4><div id="findings"></div></section><section><h4>Камера и редактор</h4><div id="exifChecks"></div></section></div></section>
+      <section id="pixelAnalysis" class="method-section" aria-labelledby="pixelsTitle"><div class="report-heading"><h3 id="pixelsTitle">Пиксельный анализ</h3><span id="pixelSummary"></span></div><p class="method-note">Эти эвристики не входят в итоговый процент.</p><div id="forensicSignals" class="forensic-signals"></div><div id="forensicMaps" class="forensic-maps"></div></section>
       <section id="visualAnalysis" class="visual-analysis" hidden aria-labelledby="visionTitle">
-        <h3 id="visionTitle">Что заметила модель</h3>
+        <div class="vision-heading"><h3 id="visionTitle">Смысловой анализ</h3><span id="signalCount" class="count-badge" hidden></span></div>
+        <p id="visionHeading" class="vision-state"></p>
         <p id="visionExplanation"></p>
-        <p class="vision-note">Области указаны моделью приблизительно. Наблюдения могут иметь другие объяснения.</p>
+        <details id="visionResponseDetails" class="method-details" hidden><summary>Причина</summary><p id="visionResponseText"></p></details>
+        <p id="visionNote" class="vision-note" hidden>Области указаны моделью приблизительно. Наблюдения могут иметь другие объяснения.</p>
         <div id="visionImageFrame" class="vision-image"><img id="visionPreview" alt="Изображение с отмеченными моделью областями"><div id="visionRegions"></div></div>
+        <p id="regionHint" class="vision-note" hidden></p><p id="regionSelection" class="region-selection" hidden></p>
         <div id="visionSignals" class="vision-signals"></div>
-        <ul id="visionLimitations"></ul>
-        <details><summary>JSON результата</summary><pre id="visionJson"></pre></details>
+        <details id="visionLimitsDetails" class="analysis-limits" hidden><summary>Ограничения анализа</summary><ul id="visionLimitations"></ul></details>
+        <details id="visionJsonSection" hidden><summary>JSON результата</summary><pre id="visionJson"></pre></details>
       </section>
       <details id="reportDetails" class="report">
         <summary><span class="report-summary-copy"><svg class="icon" aria-hidden="true"><use href="#icon-scan"/></svg><span>Посмотреть подробный отчёт<small>Источники, метаданные и карты анализа</small></span></span><span class="report-plus" aria-hidden="true">+</span></summary>
         <div class="report-body">
           <p id="scoreBasis" class="score-basis"></p>
-          <div class="report-grid"><section><h3>Найденные признаки</h3><div id="findings"></div></section><section><h3>Файл</h3><div id="fileFacts" class="file-facts"></div><details class="metadata-details"><summary>Метаданные</summary><div id="metadata" class="metadata"></div></details></section></div>
-          <section class="report-section"><div class="report-heading"><h3>Модели и сервисы</h3><span id="apiConsensus"></span></div><div id="apiResults" class="api-results"></div></section>
-          <section class="report-section"><div class="report-heading"><h3>Пиксельный анализ</h3><span id="resourceBudget"></span></div><div id="forensicSignals" class="forensic-signals"></div><div id="forensicMaps" class="forensic-maps"></div><div class="forensic-details"><div><h4>C2PA</h4><div id="c2paResult"></div></div><div><h4>EXIF</h4><div id="exifChecks"></div></div><div><h4>Хеши</h4><div id="hashes"></div></div></div></section>
+          <div class="report-grid"><section><h3>Файл</h3><div id="fileFacts" class="file-facts"></div><details class="metadata-details"><summary>Метаданные</summary><div id="metadata" class="metadata"></div></details></section><section><h3>Ресурсы и идентификаторы</h3><p id="resourceBudget" class="method-note"></p><div id="hashes"></div><h4>Проверка C2PA</h4><div id="c2paResult"></div></section></div>
         </div>
       </details>
     </section>
@@ -158,6 +162,6 @@
     </section>
   </main>
   <footer class="site-footer page-width"><a class="footer-brand" href="/">ANTISLOP</a><a href="#checker">Проверить изображение <span aria-hidden="true">↗</span></a><span>© 2026</span></footer>
-  <script src="/static/app.js?v=15"></script>
+  <script src="/static/app.js?v=16"></script>
 </body>
 </html>

@@ -1,8 +1,10 @@
 """Worker resource supervision and bounded preprocessing regression checks."""
 import io
+import json
 import os
 import subprocess
 import tempfile
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -59,28 +61,31 @@ def test_preprocess_is_bounded_and_preserves_center_crop():
 
 class Worker:
     pid = 123
-    def __init__(self):
+    def __init__(self, block=False):
         self.returncode = None
         self.killed = False
         self.calls = []
+        self.block = block
+        self.terminated = threading.Event()
     def __enter__(self): return self
     def __exit__(self, *args): pass
     def poll(self): return self.returncode
     def kill(self):
         self.killed = True
         self.returncode = -9
+        self.terminated.set()
     def communicate(self, input=None, timeout=None):
         self.calls.append((input, timeout))
-        if timeout is not None and len(self.calls) == 1:
-            raise subprocess.TimeoutExpired('worker', timeout)
-        if timeout is not None:
+        if self.block:
+            assert self.terminated.wait(2), 'Worker must be stopped before communication is joined'
+        if not self.killed:
             self.returncode = 0
         return b'{}', b''
 
 
 def test_watchdog_cleanup_and_stdin():
     for situation in ('ok', 'memory', 'denied', 'gone', 'timeout'):
-        worker = Worker()
+        worker = Worker(block=situation in ('memory', 'denied', 'timeout'))
         monitored = Mock()
         monitored.memory_info.return_value = SimpleNamespace(rss=100)
         if situation == 'memory':
@@ -99,11 +104,18 @@ def test_watchdog_cleanup_and_stdin():
             else:
                 assert situation in ('ok', 'gone')
         assert worker.killed == (situation in ('memory', 'denied', 'timeout'))
-        assert worker.calls[-1] == (None, None), 'Pipes must be drained on every exit'
-        inputs = [value for value, timeout in worker.calls if value is not None]
-        assert len(inputs) <= 1
-        if situation in ('ok', 'gone'):
-            assert inputs == [b'image']
+        assert worker.calls == [(b'image', None)], 'One call must send stdin and drain both output pipes'
+
+
+def test_large_stdin_survives_watchdog_checks():
+    with tempfile.TemporaryDirectory() as directory:
+        script = Path(directory) / 'worker.py'
+        script.write_text('import sys, time, json\ntime.sleep(0.2)\ndata=sys.stdin.buffer.read()\nprint(json.dumps({"bytes":len(data)}))\n')
+        data = b'x' * (5 * 1024 * 1024)
+        with patch.object(local_model, 'WORKER_PATH', script), patch.object(local_model, 'WORKER_TIMEOUT', 2):
+            result = local_model._run_worker(data, os.environ.copy())
+        assert result.returncode == 0
+        assert json.loads(result.stdout)['bytes'] == len(data), 'A delayed reader must receive the entire image'
 
 
 def test_real_watchdog_stops_worker():
@@ -133,6 +145,7 @@ if __name__ == '__main__':
     test_platform_limits()
     test_preprocess_is_bounded_and_preserves_center_crop()
     test_watchdog_cleanup_and_stdin()
+    test_large_stdin_survives_watchdog_checks()
     test_real_watchdog_stops_worker()
     test_real_inference()
     print('local model resource and inference tests passed')

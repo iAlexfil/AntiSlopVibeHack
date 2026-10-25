@@ -33,6 +33,36 @@ def test_clean_image_has_no_strong_signal() -> None:
     assert result["confidence"] == 0
 
 
+def test_only_verified_generative_c2pa_is_strong() -> None:
+    data = png_with_metadata()
+    cases = [
+        ("valid", True, True, True),
+        ("invalid", True, True, False),
+        ("untrusted", True, True, False),
+        ("present", False, True, False),
+        ("valid", False, True, False),
+        ("valid", None, True, False),
+        ("valid", True, False, False),
+    ]
+    for status, signature_valid, generative, verified in cases:
+        c2pa = {"status": status, "generative": generative, "signature_valid": signature_valid}
+        with patch.object(main, "run_forensics", return_value={"c2pa": c2pa}):
+            result = analyze_image(data, "sample.png")
+        assert result["forensics"]["c2pa"] == c2pa
+        strong = [item for item in result["findings"] if item["level"] == "strong"]
+        assert bool(strong) is verified, c2pa
+        if verified:
+            assert [item["kind"] for item in strong] == ["c2pa_generative"]
+        elif generative:
+            assert result["verdict"] == "review"
+            assert [item["kind"] for item in result["findings"]] == ["c2pa_invalid"]
+        else:
+            assert result["verdict"] == "clear"
+            assert result["findings"] == []
+        merged = main.merge_service_results(result, [])
+        assert merged["generation_probability"]["percent"] == (99 if verified else None), c2pa
+
+
 async def test_auth_status_is_local_and_safe() -> None:
     with patch.object(main, "vision_auth_status", return_value={
         "configured": False, "mode": "chatgpt_plan", "model": "gpt-6-luna", "detail": "Нужен вход",
@@ -81,6 +111,7 @@ async def test_remote_analysis_can_be_disabled() -> None:
 if __name__ == "__main__":
     test_detects_stable_diffusion_metadata()
     test_clean_image_has_no_strong_signal()
+    test_only_verified_generative_c2pa_is_strong()
     asyncio.run(test_auth_status_is_local_and_safe())
     asyncio.run(test_remote_analysis_can_be_disabled())
     print("image analysis and remote opt-out tests passed")
