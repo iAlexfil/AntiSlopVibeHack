@@ -6,3 +6,6 @@ httpx>=0.28,<1
 python-dotenv>=1.0,<2
 c2pa-python>=0.38,<1
 onnxruntime>=1.23,<2
+pydantic>=2.11,<3
+PyJWT[crypto]>=2.10,<3
+psutil>=7,<8

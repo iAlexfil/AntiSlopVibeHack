@@ -33,6 +33,18 @@ def test_clean_image_has_no_strong_signal() -> None:
     assert result["confidence"] == 0
 
 
+async def test_auth_status_is_local_and_safe() -> None:
+    with patch.object(main, "vision_auth_status", return_value={
+        "configured": False, "mode": "chatgpt_plan", "model": "gpt-6-luna", "detail": "Нужен вход",
+    }):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=main.app), base_url="http://test") as client:
+            assert (await client.get("/health")).json() == {"status": "ok"}
+            response = await client.get("/api/vision/auth")
+            assert response.status_code == 200
+            assert response.json()["configured"] is False
+            assert set(response.json()) == {"configured", "mode", "model", "detail"}
+
+
 async def test_remote_analysis_can_be_disabled() -> None:
     data = png_with_metadata()
     local_result = {"id": "local_frontier", "status": "error", "detail": "Модель недоступна"}
@@ -69,5 +81,6 @@ async def test_remote_analysis_can_be_disabled() -> None:
 if __name__ == "__main__":
     test_detects_stable_diffusion_metadata()
     test_clean_image_has_no_strong_signal()
+    asyncio.run(test_auth_status_is_local_and_safe())
     asyncio.run(test_remote_analysis_can_be_disabled())
     print("image analysis and remote opt-out tests passed")

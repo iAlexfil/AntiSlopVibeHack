@@ -388,6 +388,7 @@ function setBusy(busy) {
 
 function clearReport() {
   results.hidden = true;
+  $('#visualAnalysis').hidden = true;
   $('#reportDetails').open = false;
   ['#breakdownGrid', '#findings', '#fileFacts', '#metadata', '#apiResults', '#forensicSignals', '#forensicMaps', '#c2paResult', '#exifChecks', '#hashes'].forEach((selector) => {
     $(selector)?.replaceChildren();
@@ -582,6 +583,7 @@ function renderOverall(data) {
 
 function missingMetricState(item, data) {
   const providerResults = asArray(data.api_results);
+  if (item.status === 'error') return { label: 'Ошибка', note: item.detail || 'Источник не смог завершить проверку.' };
   if (item.id === 'model') {
     const model = providerResults.find((entry) => entry.id === 'local_frontier') || data.local_model;
     return { label: model?.status === 'error' ? 'Нет ответа' : 'Недоступна', note: model?.status === 'error' ? 'Локальная модель не смогла завершить проверку.' : 'Локальная модель недоступна для этой проверки.' };
@@ -721,6 +723,71 @@ function appendDetail(root, label, value) {
   root.append(row);
 }
 
+function renderVision(data) {
+  const result = asArray(data.api_results).find((item) => item.id === 'openai_vision' && item.status === 'ok' && item.analysis);
+  const root = $('#visualAnalysis');
+  root.hidden = !result;
+  if (!result) return;
+  const analysis = result.analysis;
+  $('#visionExplanation').textContent = analysis.explanation || '';
+  $('#visionJson').textContent = JSON.stringify(analysis, null, 2);
+  const image = $('#visionPreview');
+  $('#visionImageFrame').hidden = !(previewAvailable && previewUrl);
+  image.onload = () => {
+    $('#visionImageFrame').style.width = `${Math.min(640, 480 * image.naturalWidth / image.naturalHeight)}px`;
+  };
+  if (previewAvailable && previewUrl) image.src = previewUrl;
+  const regions = $('#visionRegions');
+  const signals = $('#visionSignals');
+  regions.replaceChildren();
+  signals.replaceChildren();
+  const select = (index) => {
+    root.querySelectorAll('[data-signal]').forEach((element) => {
+      const active = element.dataset.signal === String(index);
+      element.classList.toggle('active', active);
+      if (element.tagName === 'BUTTON') element.setAttribute('aria-pressed', String(active));
+    });
+  };
+  const strength = { weak: 'слабый', moderate: 'средний', strong: 'сильный' };
+  asArray(analysis.signals).forEach((signal, index) => {
+    const card = document.createElement('article');
+    card.className = 'vision-signal';
+    card.dataset.signal = index;
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.textContent = `${index + 1}. ${signal.observation}`;
+    button.dataset.signal = index;
+    button.setAttribute('aria-pressed', 'false');
+    button.addEventListener('click', () => select(index));
+    card.append(button);
+    appendDetail(card, 'Сигнал', strength[signal.strength] || signal.strength);
+    appendDetail(card, 'Объяснение', signal.explanation);
+    appendDetail(card, 'Другая возможная причина', signal.alternative_explanation);
+    signals.append(card);
+    if (signal.region) {
+      const box = document.createElement('button');
+      box.type = 'button';
+      box.className = 'vision-region';
+      box.dataset.signal = index;
+      box.textContent = index + 1;
+      box.setAttribute('aria-label', `Признак ${index + 1}: ${signal.observation}`);
+      box.setAttribute('aria-pressed', 'false');
+      const { x1, y1, x2, y2 } = signal.region;
+      Object.assign(box.style, { left: `${x1 * 100}%`, top: `${y1 * 100}%`, width: `${(x2 - x1) * 100}%`, height: `${(y2 - y1) * 100}%` });
+      box.addEventListener('click', () => select(index));
+      regions.append(box);
+    }
+  });
+  if (!asArray(analysis.signals).length) signals.textContent = 'Явных визуальных признаков не найдено. Это не подтверждает подлинность.';
+  const limitations = $('#visionLimitations');
+  limitations.replaceChildren();
+  asArray(analysis.limitations).forEach((text) => {
+    const item = document.createElement('li');
+    item.textContent = text;
+    limitations.append(item);
+  });
+}
+
 function renderForensics(data) {
   ['#forensicSignals', '#forensicMaps', '#c2paResult', '#exifChecks', '#hashes'].forEach((selector) => $(selector).replaceChildren());
   setText('#resourceBudget', '');
@@ -782,6 +849,7 @@ function renderResult(data) {
   renderBreakdown(data);
   renderFileReport(data);
   renderApiResults(data);
+  renderVision(data);
   renderForensics(data);
   $('#reportDetails').open = false;
   results.hidden = false;

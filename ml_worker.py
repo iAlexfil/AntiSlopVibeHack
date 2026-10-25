@@ -13,11 +13,14 @@ from pathlib import Path
 MEMORY_LIMIT_MB = 768
 CPU_LIMIT_SECONDS = 20
 MAX_INPUT_BYTES = 20 * 1024 * 1024
+MAX_IMAGE_PIXELS = 40_000_000
 
 
 def _set_limits() -> None:
     memory = MEMORY_LIMIT_MB * 1024 * 1024
-    resource.setrlimit(resource.RLIMIT_AS, (memory, memory))
+    # macOS reserves huge virtual mappings; the parent enforces RSS instead.
+    if sys.platform != "darwin":
+        resource.setrlimit(resource.RLIMIT_AS, (memory, memory))
     resource.setrlimit(resource.RLIMIT_CPU, (CPU_LIMIT_SECONDS, CPU_LIMIT_SECONDS + 2))
     os.environ.setdefault("OMP_NUM_THREADS", "1")
     os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
@@ -29,13 +32,23 @@ def _preprocess(raw: bytes):
     import numpy as np
     from PIL import Image
 
-    image = Image.open(io.BytesIO(raw)).convert("RGB")
-    width, height = image.size
-    scale = 440 / min(width, height)
-    resized = image.resize((round(width * scale), round(height * scale)), Image.Resampling.BICUBIC)
-    left = (resized.width - 384) // 2
-    top = (resized.height - 384) // 2
-    crop = resized.crop((left, top, left + 384, top + 384))
+    with Image.open(io.BytesIO(raw)) as source:
+        width, height = source.size
+        if width * height > MAX_IMAGE_PIXELS:
+            raise ValueError("image exceeds 40 MP")
+        image = source.convert("RGB")
+        scale = 440 / min(width, height)
+        resized_width, resized_height = round(width * scale), round(height * scale)
+        left = (resized_width - 384) // 2
+        top = (resized_height - 384) // 2
+        if resized_width * resized_height <= MAX_IMAGE_PIXELS:
+            resized = image.resize((resized_width, resized_height), Image.Resampling.BICUBIC)
+            crop = resized.crop((left, top, left + 384, top + 384))
+        else:
+            # Extreme aspect ratios must not allocate an unbounded long side.
+            box = (left * width / resized_width, top * height / resized_height,
+                   (left + 384) * width / resized_width, (top + 384) * height / resized_height)
+            crop = image.resize((384, 384), Image.Resampling.BICUBIC, box=box)
     values = np.asarray(crop, dtype=np.float32) / 255.0
     mean = np.asarray([0.485, 0.456, 0.406], dtype=np.float32)
     std = np.asarray([0.229, 0.224, 0.225], dtype=np.float32)
@@ -67,7 +80,7 @@ def main() -> None:
     # Frozen bias-only calibrator published with the model.
     calibrated_logit = logit - 0.7403357915937764
     probability = 1.0 / (1.0 + math.exp(-max(-50.0, min(50.0, calibrated_logit))))
-    peak_rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+    peak_rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (1024 * 1024 if sys.platform == "darwin" else 1024)
     print(json.dumps({
         "probability": round(probability, 6),
         "logit": round(logit, 6),

@@ -75,6 +75,15 @@
         <div class="score-scale"><div class="score-line"><span id="probabilityFill"></span><i id="probabilityMarker" aria-hidden="true"></i></div><div class="scale-labels"><span>Меньше признаков ИИ</span><span>Больше признаков ИИ</span></div></div>
       </article>
       <section class="breakdown" aria-labelledby="breakdownTitle"><div class="breakdown-heading"><h3 id="breakdownTitle">Что показала проверка</h3></div><div id="breakdownGrid"></div></section>
+      <section id="visualAnalysis" class="visual-analysis" hidden aria-labelledby="visionTitle">
+        <h3 id="visionTitle">Что заметила модель</h3>
+        <p id="visionExplanation"></p>
+        <p class="vision-note">Области указаны моделью приблизительно. Наблюдения могут иметь другие объяснения.</p>
+        <div id="visionImageFrame" class="vision-image"><img id="visionPreview" alt="Изображение с отмеченными моделью областями"><div id="visionRegions"></div></div>
+        <div id="visionSignals" class="vision-signals"></div>
+        <ul id="visionLimitations"></ul>
+        <details><summary>JSON результата</summary><pre id="visionJson"></pre></details>
+      </section>
       <details id="reportDetails" class="report">
         <summary><span class="report-summary-copy"><svg class="icon" aria-hidden="true"><use href="#icon-scan"/></svg><span>Посмотреть подробный отчёт<small>Источники, метаданные и карты анализа</small></span></span><span class="report-plus" aria-hidden="true">+</span></summary>
         <div class="report-body">

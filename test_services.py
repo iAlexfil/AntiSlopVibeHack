@@ -3,6 +3,7 @@ from copy import deepcopy
 from email.parser import BytesParser
 from email.policy import default
 import io
+import json
 import os
 from unittest.mock import AsyncMock, patch
 
@@ -85,26 +86,147 @@ def test_consensus_merge() -> None:
     breakdown = {item["id"]: item for item in merged["probability_breakdown"]}
     assert breakdown["external"]["percent"] == 63
     assert breakdown["model"]["percent"] is None
+    failed = merge_service_results({"verdict": "clear"}, [
+        {"id": "local_frontier", "status": "error", "detail": "Локальная модель превысила лимит памяти"},
+    ])
+    model = next(item for item in failed["probability_breakdown"] if item["id"] == "model")
+    assert model["status"] == "error" and model["percent"] is None
+    assert model["detail"] == "Локальная модель превысила лимит памяти"
+
+
+def visual_answer() -> dict:
+    return {
+        "schema_version": "1.0", "probability": 91, "assessment": "likely_ai",
+        "explanation": "Несогласованная анатомия", "signals": [{
+            "category": "anatomy", "observation": "Лишняя конечность",
+            "explanation": "Видно неоднозначное соединение лапы с телом.",
+            "alternative_explanation": "Возможен монтаж или перекрытие объектов.",
+            "strength": "strong", "region": {"x1": 0.1, "y1": 0.2, "x2": 0.5, "y2": 0.8},
+        }], "limitations": ["Уменьшенная копия изображения"],
+    }
+
+
+def sse(event: dict) -> str:
+    return "data: " + json.dumps(event) + "\n\n"
 
 
 async def test_openai_vision_adapter() -> None:
-    image = Image.new("RGB", (32, 32), "white")
-    buffer = io.BytesIO()
-    image.save(buffer, "PNG")
+    answer = visual_answer()
+    seen = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        body = __import__("json").loads(request.content)
-        assert body["model"] == os.getenv("OPENAI_VISION_MODEL", "gpt-6-luna")
-        assert body["input"][0]["content"][1]["type"] == "input_image"
-        answer = '{"probability":91,"assessment":"likely_ai","summary":"Несогласованная анатомия","signals":["лишняя конечность"]}'
-        return httpx.Response(200, json={"output": [{"type": "message", "content": [{"type": "output_text", "text": answer}]}]})
+        seen.append(request)
+        assert request.url == "https://api.openai.com/v1/responses"
+        assert request.headers["Authorization"] == "Bearer oauth-only"
+        body = json.loads(request.content)
+        assert body["model"] == "gpt-6-luna"
+        assert body["store"] is False and body["stream"] is True
+        assert "max_output_tokens" not in body
+        assert body["text"]["format"]["strict"] is True
+        image_url = body["input"][0]["content"][1]["image_url"]
+        assert image_url.startswith("data:image/jpeg;base64,")
+        event = {"type": "response.completed", "response": {"status": "completed", "output": [
+            {"type": "message", "content": [{"type": "output_text", "text": json.dumps(answer)}]},
+        ]}}
+        return httpx.Response(200, text=sse(event), headers={"Content-Type": "text/event-stream"})
 
-    with patch.dict(os.environ, {"OPENAI_API_KEY": "test"}):
+    with patch.dict(os.environ, {"OPENAI_API_KEY": "synthid-only", "CHATGPT_VISION_MODEL": "gpt-6-luna"}), \
+            patch.object(services.chatgpt_auth.ChatGPTAuth, "access_token", new_callable=AsyncMock, return_value="oauth-only"):
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-            result = await _openai_vision(client, buffer.getvalue(), "test.png", "image/png")
-    assert result["score"] == 0.91
-    assert result["verdict"] == "ai"
-    assert result["semantic"] is True
+            result = await _openai_vision(client, image_bytes(), "test.png", "image/png")
+            assert result["score"] == 0.91 and result["verdict"] == "ai"
+            assert result["semantic"] is True and result["analysis"] == answer
+            assert result["auth_mode"] == "chatgpt_plan"
+            answer.update(probability=None, assessment="insufficient_detail", signals=[])
+            result = await _openai_vision(client, image_bytes(), "test.png", "image/png")
+            assert result["score"] is None and result["verdict"] == "unknown"
+            merged = merge_service_results({"verdict": "clear"}, [{**result, "id": "openai_vision"}])
+            assert merged["generation_probability"]["percent"] is None
+    assert len(seen) == 2
+
+
+async def test_vision_failures_do_not_fall_back_or_leak_secrets() -> None:
+    failures = [
+        (200, sse({"type": "error", "code": "subscription_sharing_usage_limit_exceeded", "message": "private-secret"})),
+        (200, sse({"type": "response.failed", "response": {"error": {
+            "code": "subscription_sharing_usage_limit_exceeded", "message": "private-secret"}}})),
+        (200, sse({"type": "response.incomplete", "response": {"error": None}})),
+        (200, sse({"type": "response.output_text.delta", "delta": "private-secret"})),
+        (200, sse({"type": "response.completed", "response": {"status": "completed", "output": [
+            {"type": "message", "content": [{"type": "output_text", "text": "private-secret"}]}]}})),
+        (200, "data: " + "x" * (2 * 1024 * 1024) + "\n\n"),
+        (401, "private-secret"), (429, "private-secret"),
+    ]
+    for code, body in failures:
+        calls = []
+        def handler(request):
+            calls.append(request)
+            return httpx.Response(code, text=body)
+        with patch.object(services.chatgpt_auth.ChatGPTAuth, "access_token", new_callable=AsyncMock, return_value="private-secret"):
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                result = await services._run_one("openai_vision", _openai_vision, client, image_bytes(), "x.png", "image/png")
+        assert len(calls) == 1
+        assert result["status"] == "error" and "private-secret" not in str(result)
+        assert "https://" not in result["detail"]
+    with patch.object(services.chatgpt_auth.ChatGPTAuth, "access_token", new_callable=AsyncMock,
+                      side_effect=services.chatgpt_auth.AuthError("Требуется повторный вход.")):
+        async with httpx.AsyncClient(transport=httpx.MockTransport(lambda request: (_ for _ in ()).throw(AssertionError("No API call allowed")))) as client:
+            result = await services._run_one("openai_vision", _openai_vision, client, image_bytes(), "x.png", "image/png")
+            assert result["detail"] == "Требуется повторный вход."
+
+
+async def test_vision_stream_accepts_text_only_after_completion() -> None:
+    answer = json.dumps(visual_answer(), ensure_ascii=False)
+    chunks = [
+        sse({"type": "response.output_text.delta", "output_index": 0, "content_index": 0, "delta": answer[:30]}),
+        sse({"type": "response.output_text.delta", "output_index": 0, "content_index": 0, "delta": answer[30:]}),
+    ]
+    completed = sse({"type": "response.completed", "response": {"status": "completed", "output": []}})
+    done = sse({"type": "response.output_text.done", "output_index": 0, "content_index": 0, "text": answer})
+    for stream in ("".join(chunks) + completed, "".join(chunks) + done + completed, done + completed):
+        assert await services._vision_stream(httpx.Response(200, text=stream)) == answer
+    for terminal in ("", sse({"type": "response.incomplete", "response": {"error": None}}),
+                     sse({"type": "error", "code": "subscription_sharing_usage_limit_exceeded"})):
+        try:
+            await services._vision_stream(httpx.Response(200, text="".join(chunks) + done + terminal))
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("Partial or failed streamed text was accepted")
+
+
+def test_vision_contract_rejects_bad_results() -> None:
+    from vision_contract import VisualAnalysis
+    from pydantic import ValidationError
+    invalid = []
+    for changes in ({"probability": True}, {"probability": 101}, {"probability": None},
+                    {"schema_version": "2.0"}, {"extra": "secret"}):
+        invalid.append({**visual_answer(), **changes})
+    for region in ({"x1": 0.5, "y1": 0.1, "x2": 0.1, "y2": 0.8},
+                   {"x1": -0.1, "y1": 0.1, "x2": 0.5, "y2": 0.8}):
+        value = visual_answer()
+        value["signals"][0]["region"] = region
+        invalid.append(value)
+    for value in invalid:
+        try:
+            VisualAnalysis.model_validate(value)
+        except ValidationError:
+            pass
+        else:
+            raise AssertionError("Invalid visual result accepted")
+
+
+def test_vision_preview_keeps_orientation_and_bounds():
+    import base64
+    image = Image.new("RGB", (2000, 1000), "white")
+    output = io.BytesIO()
+    exif = Image.Exif()
+    exif[274] = 6
+    image.save(output, "JPEG", exif=exif)
+    data_url = services._vision_data_url(output.getvalue())
+    with Image.open(io.BytesIO(base64.b64decode(data_url.split(",", 1)[1]))) as preview:
+        assert preview.size == (640, 1280)
+        assert preview.getexif().get(274) is None
 
 
 def provenance_payload(outcome: str = "not_detected") -> dict:
@@ -239,7 +361,7 @@ async def test_provenance_http_failures_are_safe_and_not_retried() -> None:
 
 
 async def test_provenance_registry_and_configuration() -> None:
-    with patch.dict(os.environ, {}, clear=True):
+    with patch.dict(os.environ, {}, clear=True), patch.object(services.chatgpt_auth, "status", return_value={"configured": False, "mode": "chatgpt_plan"}):
         catalog = {item["id"]: item for item in services.provider_catalog()}
         assert not catalog["synthid"]["configured"]
         assert catalog["synthid"]["required_env"] == ["OPENAI_API_KEY"]
@@ -252,13 +374,13 @@ async def test_provenance_registry_and_configuration() -> None:
     async def fake_runner(provider_id, *args):
         return {"id": provider_id, "status": "ok", "verdict": "unknown", "score": None}
 
-    with patch.dict(os.environ, {"OPENAI_API_KEY": "test"}, clear=True):
+    with patch.dict(os.environ, {"OPENAI_API_KEY": "test"}, clear=True), patch.object(services.chatgpt_auth, "status", return_value={"configured": False, "mode": "chatgpt_plan"}):
         catalog = {item["id"]: item for item in services.provider_catalog()}
         assert catalog["synthid"]["configured"]
         assert services.RUNNERS["synthid"] is _openai_provenance
         with patch.object(services, "_run_one", new_callable=AsyncMock, side_effect=fake_runner) as runner:
             await services.analyze_with_services(image_bytes(), "image.png", "image/png")
-        assert {call.args[0] for call in runner.await_args_list} == {"synthid", "openai_vision"}
+        assert {call.args[0] for call in runner.await_args_list} == {"synthid"}
 
 
 def test_provenance_merge_is_one_positive_signal_and_never_negative_evidence() -> None:
@@ -300,6 +422,10 @@ def test_provenance_merge_is_one_positive_signal_and_never_negative_evidence() -
 if __name__ == "__main__":
     asyncio.run(run_adapter_tests())
     asyncio.run(test_openai_vision_adapter())
+    asyncio.run(test_vision_failures_do_not_fall_back_or_leak_secrets())
+    asyncio.run(test_vision_stream_accepts_text_only_after_completion())
+    test_vision_contract_rejects_bad_results()
+    test_vision_preview_keeps_orientation_and_bounds()
     test_consensus_merge()
     asyncio.run(test_provenance_original_multipart_and_format_sniffing())
     asyncio.run(test_provenance_negative_optional_checks_and_c2pa())

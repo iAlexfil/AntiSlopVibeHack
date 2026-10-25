@@ -10,20 +10,24 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 import httpx
-from PIL import Image
+from PIL import Image, ImageOps
+
+import chatgpt_auth
+from vision_contract import VISION_PROMPT, VisualAnalysis
 
 
 ProviderResult = dict[str, Any]
 ProviderCall = Callable[[httpx.AsyncClient, bytes, str, str], Awaitable[ProviderResult]]
 
 TIMEOUT_SECONDS = 25.0
+VISION_GATE = asyncio.Semaphore(1)
 
 PROVIDER_CATALOG = (
     {
         "id": "openai_vision",
-        "name": "OpenAI Vision",
-        "env": ("OPENAI_API_KEY",),
-        "docs": "https://developers.openai.com/api/docs/guides/images-vision",
+        "name": "ChatGPT Vision",
+        "env": (),
+        "docs": "https://developers.openai.com/siwc/token-sharing-open-source",
     },
     {
         "id": "hive",
@@ -70,6 +74,9 @@ def provider_catalog() -> list[dict[str, Any]]:
     for provider in PROVIDER_CATALOG:
         required = provider["env"]
         configured = bool(required) and all(os.getenv(key) for key in required)
+        auth = chatgpt_auth.status() if provider["id"] == "openai_vision" else None
+        if auth:
+            configured = auth["configured"]
         result.append({
             "id": provider["id"],
             "name": provider["name"],
@@ -77,6 +84,7 @@ def provider_catalog() -> list[dict[str, Any]]:
             "docs": provider["docs"],
             "required_env": list(required),
             "unavailable": provider.get("unavailable"),
+            "detail": auth.get("detail") if auth else None,
         })
     return result
 
@@ -109,86 +117,84 @@ def _normalized(name: str, score: float, generator: str | None = None, detail: s
 
 
 def _vision_data_url(data: bytes) -> str:
-    """Bound request size/cost; semantic analysis does not need the full-resolution file."""
     with Image.open(io.BytesIO(data)) as image:
-        preview = image.convert("RGB")
-        preview.thumbnail((1280, 1280), Image.Resampling.LANCZOS)
+        image.thumbnail((1280, 1280))
+        image = ImageOps.exif_transpose(image).convert("RGB")
         output = io.BytesIO()
-        preview.save(output, "JPEG", quality=86, optimize=True)
-    encoded = base64.b64encode(output.getvalue()).decode("ascii")
-    return f"data:image/jpeg;base64,{encoded}"
+        image.save(output, "JPEG", quality=90)
+    return "data:image/jpeg;base64," + base64.b64encode(output.getvalue()).decode("ascii")
 
 
-def _response_output_text(payload: dict[str, Any]) -> str:
-    for item in payload.get("output") or []:
-        if item.get("type") != "message":
-            continue
-        for content in item.get("content") or []:
-            if content.get("type") == "output_text" and content.get("text"):
-                return str(content["text"])
-    raise ValueError("OpenAI Vision не вернул текстовый результат")
+async def _vision_stream(response: httpx.Response) -> str:
+    event_lines = []
+    text_parts: dict[tuple[int, int], str] = {}
+    total = 0
+    async for line in response.aiter_lines():
+        total += len(line.encode("utf-8"))
+        if total > 2 * 1024 * 1024:
+            raise ValueError("Vision stream is too large")
+        if line.startswith("data:"):
+            event_lines.append(line[5:].lstrip(" "))
+        elif not line and event_lines:
+            raw = "\n".join(event_lines)
+            event_lines = []
+            if raw == "[DONE]":
+                break
+            event = json.loads(raw)
+            kind = event.get("type")
+            if kind in {"response.output_text.delta", "response.output_text.done"}:
+                key = (event.get("output_index", 0), event.get("content_index", 0))
+                if any(type(index) is not int or index < 0 for index in key):
+                    raise ValueError("Invalid Vision text index")
+                text = event["delta" if kind == "response.output_text.delta" else "text"]
+                if not isinstance(text, str):
+                    raise ValueError("Invalid Vision text")
+                text_parts[key] = text_parts.get(key, "") + text if kind == "response.output_text.delta" else text
+            if kind in {"response.failed", "response.incomplete", "error"}:
+                code = event.get("code") or ((event.get("response") or {}).get("error") or event.get("error") or {}).get("code")
+                if code in {"subscription_sharing_usage_limit_exceeded", "subscription_sharing_usage_unavailable"}:
+                    raise ValueError("Лимит плана ChatGPT для AntiSlop недоступен или исчерпан. Платный API не использован.")
+                raise ValueError("OpenAI Vision не завершил анализ. Повторите позже.")
+            if kind == "response.completed":
+                completed = event["response"]
+                if completed.get("status") != "completed":
+                    raise ValueError("OpenAI Vision не завершил анализ. Повторите позже.")
+                texts = [part["text"] for item in completed.get("output", []) if item.get("type") == "message"
+                         for part in item.get("content", []) if part.get("type") == "output_text"]
+                # Plan OAuth streams may omit output from the completed event.
+                return "".join(texts) if texts else "".join(text_parts[key] for key in sorted(text_parts))
+    raise ValueError("Поток OpenAI Vision прерван до завершения анализа")
 
 
 async def _openai_vision(client: httpx.AsyncClient, data: bytes, filename: str, mime_type: str) -> ProviderResult:
     del filename, mime_type
-    model = os.getenv("OPENAI_VISION_MODEL", "gpt-6-luna")
-    schema = {
-        "type": "object",
-        "properties": {
-            "probability": {"type": "integer", "minimum": 0, "maximum": 100},
-            "assessment": {"type": "string", "enum": ["likely_ai", "uncertain", "likely_real"]},
-            "summary": {"type": "string"},
-            "signals": {"type": "array", "items": {"type": "string"}},
-        },
-        "required": ["probability", "assessment", "summary", "signals"],
-        "additionalProperties": False,
-    }
-    response = await client.post(
-        "https://api.openai.com/v1/responses",
-        headers={
-            "Authorization": f"Bearer {os.environ['OPENAI_API_KEY']}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "model": model,
-            "store": False,
-            "max_output_tokens": 350,
-            "input": [{
-                "role": "user",
-                "content": [
-                    {
-                        "type": "input_text",
-                        "text": (
-                            "Оцени вероятность того, что изображение полностью сгенерировано или существенно "
-                            "изменено генеративным ИИ. Анализируй семантические противоречия, анатомию, "
-                            "физику, повторения, текст и согласованность мелких деталей. Не считай сюрреалистичный "
-                            "сюжет сам по себе доказательством: он может быть постановкой, рисунком или фотомонтажом. "
-                            "Верни калиброванную вероятность и краткие наблюдаемые причины на русском."
-                        ),
-                    },
-                    {"type": "input_image", "image_url": _vision_data_url(data), "detail": "high"},
-                ],
-            }],
-            "text": {
-                "format": {
-                    "type": "json_schema",
-                    "name": "image_authenticity",
-                    "strict": True,
-                    "schema": schema,
-                }
-            },
-        },
-    )
-    response.raise_for_status()
-    analysis = json.loads(_response_output_text(response.json()))
-    probability = int(analysis["probability"])
-    signals = [str(item) for item in analysis.get("signals") or []][:3]
-    detail = str(analysis["summary"])
-    if signals:
-        detail += " · " + "; ".join(signals)
-    result = _normalized("OpenAI Vision", probability / 100, detail=detail[:520])
-    result["model"] = model
-    result["semantic"] = True
+    model = os.getenv("CHATGPT_VISION_MODEL", "gpt-6-luna")
+    async with asyncio.timeout(90), VISION_GATE:
+        auth = chatgpt_auth.ChatGPTAuth(chatgpt_auth.DIRECTORY / "credentials.json")
+        try:
+            token = await auth.access_token()
+        finally:
+            await auth.close()
+        payload = {
+            "model": model, "store": False, "stream": True,
+            "instructions": VISION_PROMPT,
+            "input": [{"role": "user", "content": [
+                {"type": "input_text", "text": "Проверь изображение и укажи наблюдаемые признаки."},
+                {"type": "input_image", "image_url": await asyncio.to_thread(_vision_data_url, data)},
+            ]}],
+            "text": {"format": {"type": "json_schema", "name": "visual_analysis", "strict": True,
+                                "schema": VisualAnalysis.model_json_schema()}},
+        }
+        async with client.stream("POST", "https://api.openai.com/v1/responses",
+                                 headers={"Authorization": f"Bearer {token}"}, json=payload, timeout=60) as response:
+            response.raise_for_status()
+            raw = await _vision_stream(response)
+    analysis = VisualAnalysis.model_validate_json(raw).model_dump()
+    score = analysis["probability"]
+    result = (_normalized("ChatGPT Vision", score / 100, detail=analysis["explanation"])
+              if score is not None else {"name": "ChatGPT Vision", "status": "ok", "score": None,
+                                         "verdict": "unknown", "detail": analysis["explanation"]})
+    result.update(model=model, semantic=True, analysis=analysis, reasoning_summary=analysis["explanation"], auth_mode="chatgpt_plan")
     return result
 
 
@@ -365,9 +371,22 @@ async def _run_one(
         result["latency_ms"] = round((time.monotonic() - started) * 1000)
         result["id"] = provider_id
         return result
-    except (httpx.HTTPError, ValueError, KeyError, TypeError) as error:
+    except (httpx.HTTPError, ValueError, KeyError, TypeError, AttributeError, TimeoutError) as error:
         status = "error"
         detail = str(error)[:240] or "Ошибка API"
+        if provider_id == "openai_vision":
+            if isinstance(error, (httpx.TimeoutException, TimeoutError)):
+                detail = "Истекло время смыслового анализа. Повторите позже."
+            elif isinstance(error, httpx.HTTPStatusError):
+                detail = f"OpenAI Vision отклонил запрос (HTTP {error.response.status_code}). Проверьте доступ и лимиты выбранного способа входа."
+            elif isinstance(error, httpx.HTTPError):
+                detail = "Не удалось связаться с OpenAI Vision."
+            elif not isinstance(error, chatgpt_auth.AuthError) and str(error) not in {
+                "Лимит плана ChatGPT для AntiSlop недоступен или исчерпан. Платный API не использован.",
+                "OpenAI Vision не завершил анализ. Повторите позже.",
+                "Поток OpenAI Vision прерван до завершения анализа",
+            }:
+                detail = "OpenAI Vision вернул некорректный или незавершённый результат."
         if provider_id == "synthid":
             if isinstance(error, httpx.HTTPStatusError):
                 code = error.response.status_code
@@ -422,7 +441,7 @@ async def analyze_with_services(data: bytes, filename: str, mime_type: str) -> l
                 "id": provider_id,
                 "name": provider["name"],
                 "status": "not_configured",
-                "detail": "Добавьте ключи в .env",
+                "detail": provider.get("detail") or "Добавьте ключи в .env",
             })
     return results
 
@@ -502,6 +521,7 @@ def _percentage(score: float) -> int:
 def _probability_breakdown(local: dict[str, Any], results: list[ProviderResult]) -> list[dict[str, Any]]:
     successful = [item for item in results if item.get("status") == "ok"]
     model = next((item for item in successful if item.get("id") == "local_frontier"), None)
+    model_result = next((item for item in results if item.get("id") == "local_frontier"), None)
     semantic = next((item for item in successful if item.get("id") == "openai_vision"), None)
     external = [
         item for item in successful
@@ -557,15 +577,16 @@ def _probability_breakdown(local: dict[str, Any], results: list[ProviderResult])
         {
             "id": "model",
             "title": "Локальная ML-модель",
+            "status": model_result.get("status") if model_result else "unavailable",
             "percent": _percentage(float(model["score"])) if model else None,
-            "detail": model.get("detail") if model else "Локальная модель не ответила.",
+            "detail": model_result.get("detail") if model_result else "Локальная модель не ответила.",
             "source_count": 1 if model else 0,
         },
         {
             "id": "semantic",
             "title": "Смысловой анализ",
-            "percent": _percentage(float(semantic["score"])) if semantic else None,
-            "detail": semantic.get("detail") if semantic else "Нужен OPENAI_API_KEY; без него этот срез не участвует в итоге.",
+            "percent": _percentage(float(semantic["score"])) if semantic and semantic.get("score") is not None else None,
+            "detail": semantic.get("detail") if semantic else "Смысловой анализ не выполнялся или не ответил. Нужен вход через ChatGPT.",
             "source_count": 1 if semantic else 0,
         },
         {

@@ -5,15 +5,50 @@ import json
 import os
 import subprocess
 import sys
+import time
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
+
+import psutil
+
+from ml_worker import MAX_INPUT_BYTES, MEMORY_LIMIT_MB
 
 
 ROOT = Path(__file__).resolve().parent
 MODEL_PATH = ROOT / "models" / "frontier-detector-fp16.onnx"
 MODEL_SHA256 = "d75791ba2fa59146025d342cfaafa9ddeab24af117642a94f752ee4c1619375d"
 WORKER_PATH = ROOT / "ml_worker.py"
+WORKER_TIMEOUT = 28
+MEMORY_POLL_SECONDS = 0.05
+
+
+def _run_worker(data: bytes, environment: dict[str, str]) -> subprocess.CompletedProcess:
+    command = [sys.executable, str(WORKER_PATH), str(MODEL_PATH)]
+    with subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE, env=environment) as process:
+        try:
+            monitored = psutil.Process(process.pid)
+            deadline = time.monotonic() + WORKER_TIMEOUT
+            pending = data
+            while True:
+                try:
+                    if monitored.memory_info().rss > MEMORY_LIMIT_MB * 1024 * 1024:
+                        raise MemoryError
+                except psutil.NoSuchProcess:
+                    pass  # The worker may have exited before the next RSS sample.
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(command, WORKER_TIMEOUT)
+                try:
+                    stdout, stderr = process.communicate(input=pending, timeout=min(MEMORY_POLL_SECONDS, remaining))
+                    return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+                except subprocess.TimeoutExpired:
+                    pending = None
+        finally:
+            if process.poll() is None:
+                process.kill()
+            process.communicate()
 
 
 @lru_cache(maxsize=1)
@@ -33,6 +68,8 @@ def model_status() -> dict[str, Any]:
 
 def run_local_model(data: bytes) -> dict[str, Any]:
     identity = {"id": "local_frontier", "name": "Frontier ViT (локально)"}
+    if not data or len(data) > MAX_INPUT_BYTES:
+        return {**identity, "status": "error", "detail": "Некорректный размер изображения для локальной модели"}
     status = model_status()
     if not status["available"]:
         return {**identity, "status": "unavailable", "detail": status["detail"]}
@@ -44,16 +81,15 @@ def run_local_model(data: bytes) -> dict[str, Any]:
         "MALLOC_ARENA_MAX": "2",
     })
     try:
-        process = subprocess.run(
-            [sys.executable, str(WORKER_PATH), str(MODEL_PATH)],
-            input=data,
-            capture_output=True,
-            timeout=28,
-            check=False,
-            env=environment,
-        )
+        process = _run_worker(data, environment)
     except subprocess.TimeoutExpired:
         return {**identity, "status": "error", "detail": "Локальная модель превысила таймаут 28 секунд"}
+    except MemoryError:
+        return {**identity, "status": "error", "detail": f"Локальная модель превысила лимит памяти {MEMORY_LIMIT_MB} МБ"}
+    except psutil.Error:
+        return {**identity, "status": "error", "detail": "Не удалось контролировать память локальной модели"}
+    except OSError:
+        return {**identity, "status": "error", "detail": "Не удалось запустить локальную модель"}
     try:
         payload = json.loads(process.stdout.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError):
