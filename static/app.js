@@ -6,6 +6,8 @@ const preview = $('#preview');
 const results = $('#results');
 const remoteToggle = $('#useRemote');
 const imagePickButtons = Array.from(document.querySelectorAll('[data-pick-image], #pickButton'));
+const imageSearchButtons = Array.from(document.querySelectorAll('[data-image-search]'));
+const imageSearchRoutes = { google: { name: 'Google' }, yandex: { name: 'Яндекс' } };
 const asArray = (value) => Array.isArray(value) ? value : [];
 const initialButtonText = analyzeButton.querySelector('span')?.textContent.trim() || 'Проверить изображение';
 const supportedTypes = new Set(['image/png', 'image/x-png', 'image/jpeg', 'image/pjpeg', 'image/webp', 'image/gif', 'image/tiff', 'image/x-tiff', 'image/bmp', 'image/x-bmp', 'image/x-ms-bmp']);
@@ -18,10 +20,282 @@ let configuredProviders = null;
 let lastRemoteEnabled = remoteToggle.checked;
 let stageTimer = null;
 let dragDepth = 0;
+let pendingImageSearch = null;
+let uploadedSearchImage = null;
 
 function setText(selector, value) {
   const element = $(selector);
   if (element) element.textContent = value;
+}
+
+function updateManualSearchVisibility() {
+  const hasFile = Boolean(selectedFile);
+  const toolbar = $('#manualSearch');
+  if (toolbar) toolbar.hidden = !hasFile;
+  imageSearchButtons.forEach((button) => {
+    const disabled = !hasFile || !Object.prototype.hasOwnProperty.call(imageSearchRoutes, button.dataset.imageSearch) || Boolean(pendingImageSearch);
+    button.disabled = disabled;
+    button.setAttribute('aria-disabled', String(disabled));
+  });
+}
+
+function setImageSearchStatus(message, isError = false) {
+  const status = $('#imageSearchStatus');
+  if (!status) return;
+  status.textContent = message;
+  status.hidden = !message;
+  status.classList.toggle('is-error', isError);
+}
+
+function searchSelectedImage(event) {
+  event.preventDefault();
+  if (!event.isTrusted) return;
+  const file = selectedFile;
+  if (!file) return;
+  const engine = event.currentTarget.dataset.imageSearch;
+  if (!Object.prototype.hasOwnProperty.call(imageSearchRoutes, engine)) return;
+  searchInternetImage(file, event.currentTarget, engine);
+}
+
+function closePendingSearchPopup(request) {
+  if (!request?.popup || request.navigated || request.popup.closed) return;
+  try {
+    if (request.popup.location.href === 'about:blank') request.popup.close();
+  } catch (_) {
+    // A tab the user has navigated elsewhere belongs to the user.
+  }
+}
+
+function cancelImageSearch() {
+  uploadedSearchImage = null;
+  const request = pendingImageSearch;
+  if (!request) return;
+  pendingImageSearch = null;
+  request.controller.abort();
+  window.clearTimeout(request.timeout);
+  window.clearTimeout(request.uploadTimeout);
+  closePendingSearchPopup(request);
+  request.button.classList.remove('is-searching');
+  request.button.setAttribute('aria-busy', 'false');
+}
+
+function ensureImageSearchActive(request) {
+  if (pendingImageSearch !== request || selectedFile !== request.file || request.controller.signal.aborted) throw new DOMException('Поиск отменён', 'AbortError');
+  if (request.popup.closed) {
+    request.controller.abort();
+    throw new Error('Вкладка поиска закрыта. Нажмите кнопку поиска ещё раз.');
+  }
+  let reservedTab = false;
+  try {
+    reservedTab = request.popup.location.href === 'about:blank';
+  } catch (_) {
+    // A cross-origin tab has already been navigated by the user.
+  }
+  if (!reservedTab) {
+    request.userNavigated = true;
+    request.controller.abort();
+    throw new Error('Вкладка поиска уже используется. Нажмите кнопку поиска, чтобы открыть новую.');
+  }
+}
+
+async function prepareYandexImage(file, signal) {
+  let source = preview;
+  let temporaryImage = null;
+  let temporaryUrl = null;
+  let canvas = null;
+  try {
+    if (selectedFile !== file || !previewAvailable || !preview.complete || !preview.naturalWidth) {
+      temporaryImage = new Image();
+      temporaryUrl = URL.createObjectURL(file);
+      source = temporaryImage;
+      await new Promise((resolve, reject) => {
+        const cleanup = () => {
+          temporaryImage.onload = null;
+          temporaryImage.onerror = null;
+          signal.removeEventListener('abort', onAbort);
+        };
+        const onAbort = () => {
+          cleanup();
+          reject(new DOMException('Поиск отменён', 'AbortError'));
+        };
+        temporaryImage.onload = () => { cleanup(); resolve(); };
+        temporaryImage.onerror = () => {
+          cleanup();
+          reject(new Error('Браузер не смог прочитать изображение для поиска. Выберите JPG, PNG или WebP.'));
+        };
+        signal.addEventListener('abort', onAbort, { once: true });
+        if (signal.aborted) onAbort();
+        else temporaryImage.src = temporaryUrl;
+      });
+    }
+    if (signal.aborted) throw new DOMException('Поиск отменён', 'AbortError');
+    const width = source.naturalWidth;
+    const height = source.naturalHeight;
+    if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) throw new Error('Не удалось определить размеры изображения. Выберите другой файл.');
+    if (width * height > 40000000) throw new Error('Для поиска поддерживаются изображения до 40 мегапикселей. Выберите уменьшенную версию.');
+    const scale = Math.min(1, 1280 / Math.max(width, height));
+    canvas = document.createElement('canvas');
+    canvas.width = Math.max(1, Math.floor(width * scale));
+    canvas.height = Math.max(1, Math.floor(height * scale));
+    const context = canvas.getContext('2d', { alpha: false });
+    if (!context) throw new Error('Браузер не смог подготовить изображение для поиска. Попробуйте другой браузер.');
+    context.fillStyle = '#fff';
+    context.fillRect(0, 0, canvas.width, canvas.height);
+    context.drawImage(source, 0, 0, canvas.width, canvas.height);
+    const blob = await new Promise((resolve, reject) => {
+      const onAbort = () => reject(new DOMException('Поиск отменён', 'AbortError'));
+      signal.addEventListener('abort', onAbort, { once: true });
+      if (signal.aborted) {
+        signal.removeEventListener('abort', onAbort);
+        onAbort();
+        return;
+      }
+      try {
+        canvas.toBlob((result) => {
+          signal.removeEventListener('abort', onAbort);
+          if (result) resolve(result);
+          else reject(new Error('Не удалось подготовить изображение. Повторите поиск.'));
+        }, 'image/jpeg', 0.86);
+      } catch (error) {
+        signal.removeEventListener('abort', onAbort);
+        reject(error);
+      }
+    });
+    if (signal.aborted) throw new DOMException('Поиск отменён', 'AbortError');
+    if (!blob.size || blob.size > 2 * 1024 * 1024 || blob.type !== 'image/jpeg') throw new Error('Не удалось подготовить компактное изображение для поиска. Выберите другой файл.');
+    return blob;
+  } finally {
+    if (canvas) { canvas.width = 1; canvas.height = 1; }
+    if (temporaryImage) temporaryImage.removeAttribute('src');
+    if (temporaryUrl) URL.revokeObjectURL(temporaryUrl);
+  }
+}
+
+function validateUploadedImageUrl(value) {
+  if (typeof value !== 'string' || !value || value.length > 4096) throw new Error('Яндекс вернул некорректный адрес изображения. Повторите поиск.');
+  let url;
+  try { url = new URL(value); }
+  catch (_) { throw new Error('Яндекс вернул некорректный адрес изображения. Повторите поиск.'); }
+  if (url.protocol !== 'https:' || url.hostname !== 'avatars.mds.yandex.net' || url.username || url.password || url.port || !url.pathname.startsWith('/get-images-cbir/')) throw new Error('Яндекс вернул некорректный адрес изображения. Повторите поиск.');
+  return url.href;
+}
+
+function uploadedImageDescriptor(data) {
+  if (!data || typeof data !== 'object' || Array.isArray(data)) throw new Error('Яндекс вернул некорректный ответ. Повторите поиск.');
+  if (data.type === 'captcha') {
+    const value = data.captcha?.['captcha-page'];
+    const url = typeof value === 'string' ? new URL(value) : null;
+    const allowed = url && ['ya.ru', 'yandex.ru', 'yandex.com'].some((host) => url.hostname === host || url.hostname.endsWith(`.${host}`));
+    if (!allowed || url.protocol !== 'https:' || url.username || url.password || url.port) throw new Error('Яндекс запросил подтверждение. Попробуйте повторить поиск позже.');
+    return { captchaUrl: url.href };
+  }
+  if (!Number.isSafeInteger(data.image_shard) || data.image_shard < 0 || typeof data.image_id !== 'string' || !data.image_id.trim() || data.image_id.length > 512 || typeof data.url !== 'string' || data.url.length > 4096) throw new Error('Яндекс вернул некорректный ответ. Повторите поиск.');
+  const previewImageUrl = validateUploadedImageUrl(data.url);
+  const originalPath = data.sizes?.orig?.path;
+  const imageUrl = validateUploadedImageUrl(typeof originalPath === 'string' && originalPath ? originalPath : previewImageUrl.replace(/\/preview$/, '/orig'));
+  if (!new URL(imageUrl).pathname.endsWith('/orig')) throw new Error('Яндекс не вернул адрес изображения для поиска. Повторите попытку.');
+  return { imageUrl, cbirId: `${data.image_shard}/${data.image_id}` };
+}
+
+function internetSearchDestination(descriptor, engine) {
+  if (descriptor.captchaUrl) return descriptor.captchaUrl;
+  if (engine === 'google') {
+    const url = new URL('https://lens.google.com/v3/upload');
+    url.search = new URLSearchParams({ url: descriptor.imageUrl, ep: 'gsbubu', st: String(Date.now()), authuser: '0', hl: 'ru', vpw: String(window.innerWidth), vph: String(window.innerHeight) }).toString();
+    return url.href;
+  }
+  const url = new URL('https://ya.ru/images/search');
+  url.search = new URLSearchParams({ rpt: 'imageview', url: descriptor.imageUrl, cbir_id: descriptor.cbirId, tabInt: '1' }).toString();
+  return url.href;
+}
+
+async function searchInternetImage(file, button, engine) {
+  if (pendingImageSearch) return;
+  let request = null;
+  try {
+    const popup = window.open('about:blank', '_blank');
+    if (!popup) throw new Error('Браузер заблокировал новую вкладку. Разрешите всплывающие окна для AntiSlop и повторите поиск.');
+    try { popup.opener = null; }
+    catch (_) {
+      popup.close();
+      throw new Error('Не удалось безопасно открыть вкладку поиска. Обновите браузер и повторите попытку.');
+    }
+    request = { file, button, popup, controller: new AbortController(), timeout: null, uploadTimeout: null, timedOut: false, navigated: false, userNavigated: false };
+    pendingImageSearch = request;
+    request.timeout = window.setTimeout(() => { request.timedOut = true; request.controller.abort(); }, 60000);
+    button.classList.add('is-searching');
+    button.setAttribute('aria-busy', 'true');
+    updateManualSearchVisibility();
+    const loadingDocument = popup.document;
+    loadingDocument.documentElement.lang = 'ru';
+    loadingDocument.title = `Поиск — ${imageSearchRoutes[engine].name}`;
+    const heading = loadingDocument.createElement('h1');
+    heading.textContent = 'Открываем поиск по изображению';
+    const explanation = loadingDocument.createElement('p');
+    explanation.textContent = 'Подготавливаем выбранную картинку для поиска…';
+    loadingDocument.body.replaceChildren(heading, explanation);
+    loadingDocument.documentElement.style.background = '#080c10';
+    loadingDocument.body.style.color = '#f0f4f5';
+    loadingDocument.body.style.fontFamily = 'system-ui, sans-serif';
+    loadingDocument.body.style.lineHeight = '1.6';
+    loadingDocument.body.style.margin = '48px';
+    let descriptor = uploadedSearchImage?.file === file && uploadedSearchImage.expiresAt > Date.now() ? uploadedSearchImage.descriptor : null;
+    if (!descriptor) {
+      setImageSearchStatus('Готовим изображение для поиска…');
+      const blob = await prepareYandexImage(file, request.controller.signal);
+      ensureImageSearchActive(request);
+      setImageSearchStatus('Отправляем изображение в Яндекс…');
+      request.uploadTimeout = window.setTimeout(() => { request.timedOut = true; request.controller.abort(); }, 25000);
+      const response = await fetch('https://ya.ru/images-apphost/image-download?cbird=111&images_avatars_size=preview&images_avatars_namespace=images-cbir', {
+        method: 'POST',
+        headers: { 'Content-Type': 'image/jpeg' },
+        body: blob,
+        credentials: 'omit',
+        mode: 'cors',
+        redirect: 'error',
+        referrerPolicy: 'no-referrer',
+        signal: request.controller.signal,
+      });
+      ensureImageSearchActive(request);
+      if (!response.ok) throw new Error(response.status === 429 ? 'Яндекс ограничил число запросов. Повторите поиск позже.' : 'Яндекс не смог принять изображение. Повторите поиск.');
+      const data = await response.json();
+      ensureImageSearchActive(request);
+      descriptor = uploadedImageDescriptor(data);
+      if (!descriptor.captchaUrl) uploadedSearchImage = { file, descriptor, expiresAt: Date.now() + 5 * 60 * 1000 };
+    }
+    ensureImageSearchActive(request);
+    const destination = internetSearchDestination(descriptor, engine);
+    setImageSearchStatus(descriptor.captchaUrl ? 'Яндекс запросил проверку. Пройдите её в новой вкладке и повторите поиск.' : '');
+    request.popup.location.replace(destination);
+    request.navigated = true;
+  } catch (error) {
+    if (request && (pendingImageSearch !== request || selectedFile !== file)) return;
+    const popupWasClosed = Boolean(request?.popup.closed);
+    if (request) closePendingSearchPopup(request);
+    const message = popupWasClosed
+      ? 'Вкладка поиска закрыта. Нажмите кнопку поиска ещё раз.'
+      : request?.timedOut
+        ? 'Яндекс слишком долго не отвечает. Повторите поиск.'
+        : request?.userNavigated
+          ? 'Вкладка поиска уже используется. Нажмите кнопку поиска, чтобы открыть новую.'
+          : error instanceof TypeError || error instanceof SyntaxError
+            ? 'Не удалось получить ответ Яндекса. Проверьте соединение и повторите поиск.'
+            : error instanceof DOMException
+              ? 'Браузер не смог подготовить или отправить изображение. Повторите поиск.'
+              : error.message || 'Не удалось открыть поиск по изображению. Повторите попытку.';
+    setImageSearchStatus(message, true);
+  } finally {
+    if (request) {
+      window.clearTimeout(request.timeout);
+      window.clearTimeout(request.uploadTimeout);
+      if (pendingImageSearch === request) {
+        pendingImageSearch = null;
+        button.classList.remove('is-searching');
+        button.setAttribute('aria-busy', 'false');
+        updateManualSearchVisibility();
+      }
+    }
+  }
 }
 
 function setAnalyzeButtonText(value) {
@@ -139,8 +413,11 @@ function releasePreview() {
 
 function reset() {
   if (isAnalyzing) return;
+  cancelImageSearch();
   releasePreview();
   selectedFile = null;
+  setImageSearchStatus('');
+  updateManualSearchVisibility();
   previewAvailable = false;
   fileInput.value = '';
   $('#previewState').hidden = true;
@@ -179,10 +456,13 @@ function chooseFile(file) {
     showError('Файл слишком большой. Максимальный размер — 20 МБ.');
     return;
   }
+  cancelImageSearch();
   releasePreview();
   clearReport();
   clearError();
   selectedFile = file;
+  setImageSearchStatus('');
+  updateManualSearchVisibility();
   previewAvailable = false;
   const objectUrl = URL.createObjectURL(file);
   previewUrl = objectUrl;
@@ -617,6 +897,7 @@ $('#newCheck').addEventListener('click', () => {
 });
 analyzeButton.addEventListener('click', analyze);
 remoteToggle.addEventListener('change', updateRemoteHint);
+imageSearchButtons.forEach((button) => button.addEventListener('click', searchSelectedImage));
 
 document.addEventListener('paste', (event) => {
   if (isAnalyzing || event.target.closest?.('input:not([type="file"]):not([type="checkbox"]):not([type="radio"]):not([type="button"]), textarea, [contenteditable="true"]')) return;
@@ -633,6 +914,8 @@ document.addEventListener('paste', (event) => {
 });
 
 setState('idle');
+setImageSearchStatus('');
+updateManualSearchVisibility();
 updateRemoteHint();
 fetch('/api/providers')
   .then((response) => {
