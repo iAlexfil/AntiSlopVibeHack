@@ -132,6 +132,21 @@ main { width: min(720px, calc(100% - 32px)); margin: 0 auto; }
 .c2pa-badge { display: inline-block; margin-bottom: 6px; padding: 3px 5px; border: 1px solid var(--line); border-radius: 4px; font-size: 10px; text-transform: uppercase; }
 .disclaimer { margin: 18px 0 0; color: var(--muted); font-size: 12px; text-align: center; }
 
+.vision-note { color: var(--muted); font-size: 12px; line-height: 1.5; }
+.visual-analysis { margin-bottom: 32px; }
+.visual-analysis h2 { font-size: 18px; }
+.visual-analysis p, .visual-analysis li { font-size: 13px; line-height: 1.5; overflow-wrap: anywhere; }
+.vision-image { position: relative; max-width: 100%; margin: 18px 0; }
+.vision-image img { display: block; width: 100%; height: auto; }
+.vision-region { position: absolute; padding: 3px; display: flex; align-items: start; justify-content: start; border: 2px solid var(--accent); background: transparent; color: #fff; font-size: 14px; font-weight: 750; text-shadow: 0 1px 3px #000, 0 0 3px #000; cursor: pointer; }
+.vision-region.active { background: rgba(255,84,56,.15); outline: 2px solid #fff; }
+.vision-signal { margin-bottom: 12px; padding: 14px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); }
+.vision-signal.active { border-color: var(--accent); }
+.vision-signal > button { padding: 0; border: 0; background: none; text-align: left; font-size: 14px; font-weight: 650; cursor: pointer; overflow-wrap: anywhere; }
+.visual-analysis details { margin-top: 12px; }
+.visual-analysis summary { cursor: pointer; font-size: 13px; }
+.visual-analysis pre { padding: 12px; max-height: 350px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; background: var(--panel); border: 1px solid var(--line); font-size: 11px; }
+
 @media (max-width: 640px) {
   .start { padding: 46px 0 64px; }
   .dropzone { min-height: 300px; }

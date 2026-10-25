@@ -16,6 +16,7 @@ from dotenv import load_dotenv
 from forensics import run_forensics
 from local_model import run_local_model
 from services import analyze_with_services, merge_service_results, provider_catalog
+from chatgpt_auth import status as vision_auth_status
 
 
 ROOT = Path(__file__).resolve().parent
@@ -234,6 +235,11 @@ async def health() -> dict[str, str]:
 @app.get("/api/providers")
 async def providers() -> list[dict[str, Any]]:
     return provider_catalog()
+
+
+@app.get("/api/vision/auth")
+async def vision_auth() -> dict[str, Any]:
+    return vision_auth_status()
 
 
 async def _read_limited_body(request: Request) -> bytes:

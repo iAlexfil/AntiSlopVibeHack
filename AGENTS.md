@@ -34,7 +34,7 @@ AntiSlop — MVP веб-сервиса, который оценивает вер
 
 1. Изображение выбирается, перетаскивается или вставляется через `Ctrl/Command + V`.
 2. Сервер выполняет локальные проверки и запускает ONNX-модель в изолированном процессе.
-3. При включённом переключателе параллельно вызываются только API с настроенными ключами.
+3. При включённом переключателе параллельно вызываются только настроенные API; смысловой анализ использует отдельную OAuth-сессию ChatGPT.
 4. Интерфейс показывает одну итоговую вероятность.
 5. Ниже выводится разбивка по пяти направлениям:
    - локальная ML-модель;
@@ -42,7 +42,8 @@ AntiSlop — MVP веб-сервиса, который оценивает вер
    - специализированные внешние детекторы;
    - вотермарки и происхождение;
    - пиксельные аномалии.
-6. Полный технический отчёт закрыт по умолчанию и раскрывается через `<details>`.
+6. Смысловой анализ показывает наблюдения, объяснения, приблизительные рамки и JSON контракта `1.0`.
+7. Полный технический отчёт закрыт по умолчанию и раскрывается через `<details>`.
 
 Важно: проценты в разбивке показывают силу конкретного сигнала. Они не являются независимыми калиброванными вероятностями и не обязаны совпадать с итогом.
 
@@ -54,14 +55,19 @@ AntiSlop — MVP веб-сервиса, который оценивает вер
 | --- | --- |
 | `main.py` | FastAPI, чтение файла, лимиты размера, метаданные, сигнатуры генераторов, запуск локальной модели и API |
 | `services.py` | адаптеры внешних API, OpenAI Vision и SynthID / C2PA, объединение результатов, итоговая вероятность и разбивка |
+| `chatgpt_login.py` | браузерный OAuth-вход с PKCE и проверкой ID-токена |
+| `chatgpt_auth.py` | чтение отдельной OAuth-сессии, безопасный refresh и статус входа |
+| `vision_contract.py` | JSON Schema, валидация и инструкции смыслового анализа |
+| `test_chatgpt_auth.py` | offline-проверки OAuth, JWT и обновления сессии |
 | `forensics.py` | C2PA, ELA, шум, FFT, повторяющиеся блоки, EXIF-логика и хеши |
-| `local_model.py` | проверка SHA-256 модели и безопасный запуск отдельного ML-процесса |
+| `local_model.py` | проверка SHA-256 модели, запуск ML-процесса, RSS watchdog и таймаут |
 | `ml_worker.py` | preprocessing, ONNX inference, калибровка и OS resource limits |
 | `models/frontier-detector-fp16.onnx` | выбранные веса локального детектора |
 | `static/index.html` | структура интерфейса |
 | `static/app.css` | актуальная вёрстка и адаптивность |
 | `static/app.js` | загрузка/вставка, запрос API, итог, разбивка и подробный отчёт |
 | `test_main.py` | metadata/signature smoke tests |
+| `test_local_model.py` | ограничения воркера, bounded preprocessing и реальный локальный inference |
 | `test_forensics.py` | forensic smoke tests |
 | `test_services.py` | адаптеры API, OpenAI structured output, provenance и aggregation tests |
 | `test_frontend.js` | состояния интерфейса, загрузка и защита от устаревших ответов |
@@ -188,18 +194,24 @@ Smoke sample `/tmp/antislope-C.jpg`, использовавшийся во вр�
 
 | ID | Сервис | Переменные окружения |
 | --- | --- | --- |
-| `openai_vision` | OpenAI Responses API с image input и structured output | `OPENAI_API_KEY`, опционально `OPENAI_VISION_MODEL` |
+| `openai_vision` | ChatGPT Vision, Responses API с OAuth и лимитами плана | OAuth через `chatgpt_login.py`; опционально `CHATGPT_VISION_MODEL` |
 | `synthid` | OpenAI Content Provenance API, SynthID / C2PA | `OPENAI_API_KEY` |
 | `hive` | Hive AI-generated media detection | `HIVE_API_KEY` |
 | `sightengine` | Sightengine genai model | `SIGHTENGINE_API_USER`, `SIGHTENGINE_API_SECRET` |
 | `aiornot` | AI or Not image report | `AIORNOT_API_KEY` |
 | `wasitai` | WasItAI classifier | `WASITAI_API_KEY` |
 
-Текущий default для OpenAI Vision: `gpt-6-luna`, но он задаётся через env и может быть заменён без изменения кода. Vision-анализ ищет семантические противоречия, анатомические ошибки, физику, повторения и проблемы текста. Перед изменением модели или схемы обязательно сверяйтесь с актуальной официальной документацией API.
+Текущий default для ChatGPT Vision: `gpt-6-luna`, но он задаётся через env и может быть заменён без изменения кода. Vision-анализ ищет семантические противоречия, анатомические ошибки, физику, повторения и проблемы текста. Перед изменением модели или схемы обязательно сверяйтесь с актуальной официальной документацией API.
 
-Адаптер `_openai_provenance` вызывает `POST https://api.openai.com/v1/content_provenance_checks` с multipart-полем `file` и общим ключом `OPENAI_API_KEY`. В API передаются исходные байты PNG/JPEG/WebP с MIME, определённым по содержимому. Ресайз и перекодирование перед проверкой запрещены, чтобы не повреждать метку и C2PA. Другие форматы не отправляются. Запрос выполняется только при `remote=true`, с таймаутом 25 секунд и без автоматических повторов.
+Адаптер `_openai_provenance` вызывает `POST https://api.openai.com/v1/content_provenance_checks` с multipart-полем `file` и ключом `OPENAI_API_KEY`, предназначенным только для этой проверки. В API передаются исходные байты PNG/JPEG/WebP с MIME, определённым по содержимому. Ресайз и перекодирование перед проверкой запрещены, чтобы не повреждать метку и C2PA. Другие форматы не отправляются. Запрос выполняется только при `remote=true`, с таймаутом 25 секунд и без автоматических повторов.
 
 Сервис проверяет только поддерживаемые OpenAI сигналы SynthID и C2PA, а не все изображения Google или других генераторов. Результаты отдельных проверок и доступные `model`, `generated_at`, `issuer`, `validation_state` сохраняются в полном отчёте. `not_detected` нейтрален. HTTP 400 означает неподдерживаемый/заблокированный файл, 404 - отсутствие доступа организации, 429 - лимит запросов; эти ответы и другие сбои не прерывают анализ. Перед изменением контракта сверяйтесь с [руководством OpenAI](https://developers.openai.com/api/docs/guides/content-provenance) и [справочником API](https://developers.openai.com/api/reference/resources/content_provenance_checks/methods/create).
+
+Смысловой анализ не читает `OPENAI_API_KEY` и не использует API-key fallback. Отдельный вход: `.venv/bin/python chatgpt_login.py`. Механизм перенесён из предоставленных пользователем `jarvis/chatgpt_login.py` и `jarvis/chatgpt_auth.py`: динамический client ID, стабильный host ID, PKCE, state/nonce, RS256/JWKS, проверка account identity и scopes. Файлы `.antislop-auth/registration.json` и `credentials.json` имеют права 0600, каталог 0700, всё хранилище исключено из Git. Сессию Jarvis или личного Codex читать/копировать не нужно. Refresh сериализован flock, ротация сохраняется даже при отмене запроса. `/api/vision/auth` возвращает только безопасный локальный статус, модель и подсказку входа.
+
+Запросы Vision: публичный `/v1/responses`, OAuth bearer, `store=false`, `stream=true`, без инструментов и платного fallback. Успех принимается только после `response.completed`, ошибки/обрыв/лимиты из SSE обрабатываются отдельно. Внешний режим остаётся обязательным: `remote=false` не запускает OAuth refresh и не отправляет изображение наружу. Официальный контракт: [вход](https://developers.openai.com/siwc/token-sharing-open-source/sign-in), [inference](https://developers.openai.com/siwc/token-sharing-open-source/models-and-inference).
+
+JSON `VisualAnalysis` версии `1.0`: probability 0..100 или null, assessment, explanation, максимум 8 signals с категорией, наблюдением, кратким объяснением, альтернативной причиной, силой и region; максимум 5 limitations. Рамки нормализованы 0..1 относительно изображения после EXIF transpose; region=null для глобального наблюдения. `insufficient_detail` требует probability=null и не добавляет численную оценку. Контракт одновременно задаёт structured output и строгую серверную валидацию. Краткое обоснование относится к видимым признакам, не к скрытой цепочке рассуждений. Формула среднего не менялась, добавленного второго semantic provider нет.
 
 Известные недоступные интеграции:
 
@@ -208,7 +220,7 @@ Smoke sample `/tmp/antislope-C.jpg`, использовавшийся во вр�
 
 Правила секретов:
 
-- реальные ключи находятся только в `.env`;
+- API-ключи находятся только в `.env`; OAuth-сессия отдельно в `.antislop-auth/`, никогда не в клиентском ответе;
 - `.env` запрещено коммитить;
 - `.env.example` содержит только пустые значения;
 - ключи нельзя возвращать клиенту, логировать или вставлять в URL;
@@ -227,8 +239,12 @@ Smoke sample `/tmp/antislope-C.jpg`, использовавшийся во вр�
 - FFT: максимум `512 px`;
 - diagnostic maps: максимум `640 px`;
 - ML input: `384 × 384`;
+- Vision preview: JPEG до `1280 px`, один запрос одновременно, общий timeout `90` секунд, сетевой timeout `60` секунд, поток до `2 MiB`;
 - ML запускается в отдельном процессе на каждый анализ;
-- `RLIMIT_AS`: `768 MiB`;
+- Linux `RLIMIT_AS`: `768 MiB`; macOS не использует несовместимый лимит виртуального адресного пространства;
+- parent RSS watchdog: `768 MiB`, опрос каждые `50 ms`, kill и сбор процесса при превышении, ошибке мониторинга или timeout;
+- RSS watchdog является программным контролем с возможным кратким превышением между опросами, а не жёстким kernel limit на macOS;
+- промежуточный ML-resize ограничен `40 MP`; при экстремальных пропорциях центральная область сразу приводится к `384x384`;
 - `RLIMIT_CPU`: `20 + 2` секунды;
 - parent timeout: `28` секунд;
 - ONNX intra/inter-op threads: `1`;
@@ -254,10 +270,12 @@ Smoke sample `/tmp/antislope-C.jpg`, использовавшийся во вр�
 ```bash
 .venv/bin/python test_main.py
 .venv/bin/python test_forensics.py
+.venv/bin/python test_local_model.py
 .venv/bin/python test_services.py
+.venv/bin/python test_chatgpt_auth.py
 node --check static/app.js
 node test_frontend.js
-.venv/bin/python -m compileall -q main.py services.py local_model.py ml_worker.py
+.venv/bin/python -m compileall -q main.py services.py chatgpt_login.py chatgpt_auth.py vision_contract.py local_model.py ml_worker.py
 curl -fsS http://127.0.0.1:8000/health
 ```
 
@@ -287,11 +305,12 @@ curl -fsS http://127.0.0.1:8000/health
 
 ## 11. Известные технические долги
 
-- На проверенном macOS arm64 локальный ML-воркер падает при установке `RLIMIT_AS=768 MiB` с `ValueError: current limit exceeds maximum limit`. Нужна отдельная безопасная защита памяти для macOS; нельзя просто пропустить лимит. Также `ru_maxrss` на macOS возвращается в байтах, а текущий расчёт MiB рассчитан на Linux KiB.
+- На macOS память ML контролирует parent RSS watchdog с интервалом 50 мс; краткий overshoot возможен. Для жёсткой изоляции памяти нужна среда с kernel-enforced limits. Ошибка RLIMIT_AS и единиц ru_maxrss исправлена.
 - Итоговый ансамбль использует простое среднее и не откалиброван на собственном validation set.
 - Нет сохранённого evaluation dataset и автоматического отчёта по ROC/PR, FPR и recall.
+- Vision может путать обычную программную графику с генеративным ИИ; численная оценка и сила наблюдений требуют отдельной проверки и калибровки.
 - Нет OCR-анализа и отдельной оценки искажённого текста.
-- Нет локализации подозрительных областей; модель классифицирует всё изображение.
+- Локальный классификатор не локализует области; Vision даёт только приблизительные рамки, их точность не измерена.
 - Нет rate limiting и очереди для внешних API.
 - Нет кэша по SHA-256, поэтому одинаковые файлы анализируются повторно.
 - Diagnostic maps возвращаются как base64 в JSON, что увеличивает ответ.
@@ -384,6 +403,34 @@ curl -fsS http://127.0.0.1:8000/health
 - какие ограничения или вопросы остались.
 
 ## 15. Журнал существенных решений
+
+### 2026-10-25 - восстановлен локальный ML на macOS, очищен интерфейс
+
+- Причиной прочерка было падение воркера на `RLIMIT_AS=768 MiB` в macOS ещё до inference. Linux сохраняет этот лимит; родитель дополнительно контролирует RSS через psutil каждые 50 мс и завершает воркер при превышении 768 MiB, недоступности мониторинга или таймауте. CPU20/22, timeout28, checksum и последовательный запуск сохранены.
+- Исправлены единицы peak RSS: macOS bytes, Linux KiB. psutil добавлен в requirements.txt. Прямой worker также проверяет 40MP до декодирования. Экстремальные пропорции не создают неограниченный resize; обычный preprocessing сохранён без изменения калибровки и порога.
+- Удалены строка статуса ChatGPT/модели/лимитов, ссылка, лишний startup-запрос статуса и дублирующее раскрытие обоснования. Обоснование результата, наблюдения, рамки и JSON сохранены. Статика v=6. Ошибка локального воркера теперь обозначается словом "Ошибка" с фактической причиной в отчёте, а не только прочерком.
+- Проверены platform limits, kill/cleanup при превышении RSS/timeout/ошибке мониторинга, единственная передача stdin, нормальный и экстремальный aspect ratio. Реальные PNG/JPEG на macOS arm64 дали успешный ответ за ~1,5-2,1 сек с пиком RSS ~175 MiB. Это runtime smoke test, не оценка качества классификатора.
+- В рабочем браузере подтверждены реальный local-only ответ и численный результат 1% вместо прочерка, отсутствие строки авторизации/лимитов, desktop и mobile 390px без переполнения. Clipboard сохранён; внешние API при этой проверке не вызывались.
+- Ограничение: RSS watchdog допускает краткое превышение между измерениями. Полный accuracy benchmark и фактический Linux inference в этой правке не выполнялись.
+
+
+### 2026-10-25 - реальная проверка OAuth после входа
+
+- Подтверждены сохранённый вход и реальный inference через рабочий интерфейс с моделью `gpt-6-luna`. SynthID/C2PA также успешно ответил, метки на контрольном файле не найдены. `.env` и содержимое токенов в вывод не попадали.
+- Исправлена обнаруженная несовместимость SSE: при OAuth текст приходил в `response.output_text.delta` и `done`, а `response.completed.output` был пуст. Адаптер собирает текст из событий, `done` заменяет чанки без дублирования; успешное завершение обязательно. Добавлена обработка top-level `error.code`.
+- Добавлен regression test для пустого terminal output, delta/done, ошибок и обрыва после готового JSON. Пройдены adapter/OAuth/main/frontend tests, независимая проверка парсера и реальный browser flow с JSON и областью.
+- Качество Vision не откалибровано: обычная графика Pillow (квадрат, круг, подпись `PUBLIC SYNTHETIC SMOKE TEST`) ошибочно получила 99% AI. Это transport smoke sample, не benchmark. Пороги, формула и промпт по одному примеру не менялись.
+- Локальная ML-модель на текущем macOS по-прежнему недоступна из-за `current limit exceeds maximum limit`; это отдельная известная проблема контроля памяти, защита не отключалась.
+
+### 2026-10-25 - смысловой анализ через отдельный OAuth-вход
+
+- `OPENAI_API_KEY` оставлен исключительно для SynthID/C2PA. Vision использует отдельную сессию Sign in with ChatGPT с лимитами плана, без API-key fallback. За основу взяты два предоставленных пользователем скрипта входа Jarvis.
+- Добавлены строгий JSON-контракт `1.0`, наблюдения с альтернативными объяснениями, приблизительные области, краткое обоснование и JSON в интерфейсе. Новый независимый semantic score не добавлялся: обновлён существующий адаптер.
+- Добавлены PyJWT[crypto] для проверки ID-токена и явно объявленный Pydantic; все зависимости сохранены в requirements.txt.
+- Offline-тесты проверяют state/PKCE, подпись/nonce/identity/scopes, concurrent refresh и сохранение ротации при cancellation, изоляцию API-ключа, SSE completion/error/interruption и JSON validation. Реальный вход требует действий пользователя в браузере; плановая квота и реальный inference без входа не подтверждены.
+- Интерфейс проверен на фиктивных ответах при 1280px и 390px: file picker, Cmd+V, выбор рамки/карточки, раскрытие JSON, remote on/off и отсутствие горизонтального переполнения. Drag-and-drop и устаревшие ответы дополнительно покрыты Node VM.
+- `.env` не читался при этих изменениях и offline-проверках. Известная проблема локального ML на macOS не менялась. Качество semantic score и точность рамок ещё не измерены на evaluation set.
+
 
 ### 2026-10-25 - проверка обновлённого интерфейса
 

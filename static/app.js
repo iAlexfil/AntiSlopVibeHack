@@ -32,6 +32,7 @@ function reset() {
   setAnalyzeButtonText('Проверить');
   dropzone.classList.remove('scanning');
   results.hidden = true;
+  $('#visualAnalysis').hidden = true;
 }
 
 function chooseFile(file) {
@@ -65,8 +66,8 @@ function renderProviderStatus(providers) {
     const name = document.createElement('b');
     const state = document.createElement('small');
     name.textContent = provider.name;
-    state.textContent = provider.configured ? 'ON' : provider.unavailable ? 'NO API' : 'NO KEY';
-    chip.title = provider.unavailable || provider.required_env.join(' + ');
+    state.textContent = provider.configured ? 'ON' : provider.unavailable ? 'NO API' : provider.id === 'openai_vision' ? 'НУЖЕН ВХОД' : 'NO KEY';
+    chip.title = provider.unavailable || provider.detail || provider.required_env.join(' + ');
     chip.append(name, state);
     root.append(chip);
   });
@@ -102,7 +103,7 @@ function renderBreakdown(data) {
     card.innerHTML = '<div class="metric-main"><span></span><strong></strong></div><div class="metric-bar"><span></span></div>';
     card.querySelector('.metric-main span').textContent = item.title;
     const number = card.querySelector('strong');
-    number.textContent = numeric ? `${item.percent}%` : '—';
+    number.textContent = numeric ? `${item.percent}%` : item.status === 'error' ? 'Ошибка' : '—';
     if (!numeric) number.classList.add('missing');
     card.querySelector('.metric-bar span').style.width = numeric ? `${item.percent}%` : '0%';
     root.append(card);
@@ -194,6 +195,70 @@ function appendDetail(root, label, value) {
   root.append(row);
 }
 
+function renderVision(data) {
+  const result = (data.api_results || []).find((item) => item.id === 'openai_vision' && item.status === 'ok' && item.analysis);
+  const root = $('#visualAnalysis');
+  root.hidden = !result;
+  if (!result) return;
+  const analysis = result.analysis;
+  $('#visionExplanation').textContent = analysis.explanation;
+  $('#visionJson').textContent = JSON.stringify(analysis, null, 2);
+  const image = $('#visionPreview');
+  image.onload = () => {
+    $('#visionImageFrame').style.width = `${Math.min(640, 480 * image.naturalWidth / image.naturalHeight)}px`;
+  };
+  image.src = preview.src;
+  const regions = $('#visionRegions');
+  const signals = $('#visionSignals');
+  regions.innerHTML = '';
+  signals.innerHTML = '';
+  const select = (index) => {
+    root.querySelectorAll('[data-signal]').forEach((element) => {
+      const active = element.dataset.signal === String(index);
+      element.classList.toggle('active', active);
+      if (element.tagName === 'BUTTON') element.setAttribute('aria-pressed', String(active));
+    });
+  };
+  (analysis.signals || []).forEach((signal, index) => {
+    const card = document.createElement('article');
+    card.className = 'vision-signal';
+    card.dataset.signal = index;
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.textContent = `${index + 1}. ${signal.observation}`;
+    button.dataset.signal = index;
+    button.setAttribute('aria-pressed', 'false');
+    button.addEventListener('click', () => select(index));
+    card.append(button);
+    const strength = {weak: 'слабый', moderate: 'средний', strong: 'сильный'};
+    appendDetail(card, 'Сигнал', strength[signal.strength] || signal.strength);
+    appendDetail(card, 'Объяснение', signal.explanation);
+    appendDetail(card, 'Другая возможная причина', signal.alternative_explanation);
+    signals.append(card);
+    if (signal.region) {
+      const box = document.createElement('button');
+      box.type = 'button';
+      box.className = 'vision-region';
+      box.dataset.signal = index;
+      box.textContent = index + 1;
+      box.setAttribute('aria-label', `Признак ${index + 1}: ${signal.observation}`);
+      box.setAttribute('aria-pressed', 'false');
+      const {x1, y1, x2, y2} = signal.region;
+      Object.assign(box.style, {left: `${x1 * 100}%`, top: `${y1 * 100}%`, width: `${(x2 - x1) * 100}%`, height: `${(y2 - y1) * 100}%`});
+      box.addEventListener('click', () => select(index));
+      regions.append(box);
+    }
+  });
+  if (!analysis.signals?.length) signals.textContent = 'Явных визуальных признаков не найдено. Это не подтверждает подлинность.';
+  const limitations = $('#visionLimitations');
+  limitations.innerHTML = '';
+  (analysis.limitations || []).forEach((text) => {
+    const item = document.createElement('li');
+    item.textContent = text;
+    limitations.append(item);
+  });
+}
+
 function renderForensics(data) {
   const report = data.forensics;
   if (!report) return;
@@ -252,6 +317,7 @@ function renderResult(data) {
   renderBreakdown(data);
   renderFileReport(data);
   renderApiResults(data);
+  renderVision(data);
   renderForensics(data);
   $('#reportDetails').open = false;
   results.hidden = false;

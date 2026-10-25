@@ -8,14 +8,19 @@ function node(id) {
   if (!nodes.has(id)) {
     const classes = new Set();
     nodes.set(id, {
+      children: [], dataset: new Proxy({}, { set(target, key, value) { target[key] = String(value); return true; } }), attributes: {},
+      append(...children) { this.children.push(...children); },
+      setAttribute(name, value) { this.attributes[name] = value; },
+      querySelectorAll() { return [...nodes.values()].filter((value) => value.dataset.signal !== undefined); },
       src: '', hidden: true, disabled: false, value: '', style: {}, listeners: {},
       classList: {
         add: (name) => classes.add(name), remove: (name) => classes.delete(name),
+        toggle(name, active) { if (active) classes.add(name); else classes.delete(name); },
         contains: (name) => classes.has(name),
       },
       addEventListener(name, callback) { (this.listeners[name] ||= []).push(callback); },
       emit(name, event = {}) { (this.listeners[name] || []).forEach((callback) => callback(event)); },
-      querySelector: (selector) => selector === 'span' ? node(`${id}-label`) : null,
+      querySelector: (selector) => node(selector === 'span' ? `${id}-label` : `${id}:${selector}`),
       removeAttribute(name) { this[name] = ''; },
       click() { this.clicks = (this.clicks || 0) + 1; },
       focus() {}, scrollIntoView() {},
@@ -29,16 +34,19 @@ const alerts = [];
 const context = vm.createContext({
   document: {
     querySelector: (selector) => node(selector.slice(1)),
+    createElement: (tag) => { const result = node(`created-${nodes.size}`); result.tagName = tag.toUpperCase(); return result; },
+    createTextNode: (text) => ({ textContent: text }),
     addEventListener: (name, callback) => node('document').addEventListener(name, callback),
   },
   URL: { createObjectURL: (file) => `blob:${file.name}`, revokeObjectURL() {} },
   window: { scrollTo() {} },
   alert: (message) => alerts.push(message),
   fetch: (url, options) => url === '/api/providers'
-    ? Promise.resolve({ json: async () => [] })
+    ? Promise.resolve({ ok: true, json: async () => [] })
     : new Promise((resolve, reject) => requests.push({ url, options, resolve, reject })),
 });
 vm.runInContext(fs.readFileSync(path.join(__dirname, 'static/app.js'), 'utf8'), context);
+assert.equal(requests.length, 0, 'The upload screen must not request a separate Vision login status');
 
 const file = (name) => ({ name, type: 'image/png', size: 100 });
 const a = file('a.png');
@@ -55,6 +63,26 @@ async function respond(request, data) {
 }
 
 async function main() {
+  context.renderBreakdown({probability_breakdown: [{id: 'model', title: 'Локальная ML-модель', percent: null, status: 'error', detail: 'Ошибка воркера'}]});
+  assert.equal(node('breakdownGrid').children.at(-1).querySelector('strong').textContent, 'Ошибка');
+  context.renderBreakdown({probability_breakdown: [{id: 'model', title: 'Локальная ML-модель', percent: 65, status: 'ok'}]});
+  assert.equal(node('breakdownGrid').children.at(-1).querySelector('strong').textContent, '65%');
+  context.chooseFile(a);
+  const analysis = {schema_version: '1.0', probability: 90, assessment: 'likely_ai', explanation: '<script>not HTML</script>',
+    signals: [{observation: '<img onerror=alert(1)>', strength: 'strong', explanation: 'Видимая деталь', alternative_explanation: 'Монтаж',
+      region: {x1: 0.1, y1: 0.2, x2: 0.5, y2: 0.8}}], limitations: ['Мелкие детали']};
+  context.renderVision({api_results: [{id: 'openai_vision', status: 'ok', analysis}]});
+  assert.equal(node('visualAnalysis').hidden, false);
+  assert.equal(node('visionExplanation').textContent, analysis.explanation);
+  assert.deepEqual(JSON.parse(node('visionJson').textContent), analysis);
+  assert.equal(node('visionPreview').src, 'blob:a.png');
+  const box = node('visionRegions').children[0];
+  assert.equal(box.style.left, '10%');
+  assert.equal(box.style.width, '40%');
+  box.emit('click');
+  assert.equal(box.attributes['aria-pressed'], 'true');
+  context.renderVision({api_results: []});
+  assert.equal(node('visualAnalysis').hidden, true);
   context.renderOverall({ generation_probability: { percent: null }, headline: 'Явные водяные знаки не найдены' });
   assert.equal(node('resultHeadline').textContent, 'Недостаточно данных');
   assert.equal(node('probabilityFill').style.width, '0%');
