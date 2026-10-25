@@ -22,10 +22,222 @@ let stageTimer = null;
 let dragDepth = 0;
 let pendingImageSearch = null;
 let uploadedSearchImage = null;
+const resultReports = { single: null, series: null };
+let pendingShare = null;
+let pendingPdf = null;
 
 function setText(selector, value) {
   const element = $(selector);
   if (element) element.textContent = value;
+}
+
+function shareStatus(kind) {
+  return $(kind === 'series' ? '#seriesShareStatus' : '#shareStatus');
+}
+
+function refreshShareButtons() {
+  document.querySelectorAll('[data-share-result]').forEach((button) => {
+    const kind = button.dataset.shareResult;
+    button.disabled = !resultReports[kind]?.reportId || Boolean(pendingShare) || Boolean(pendingPdf);
+    button.setAttribute('aria-busy', String(pendingShare?.kind === kind));
+    const label = button.querySelector('span');
+    if (label) label.textContent = resultReports[kind]?.publicUrl ? 'Копировать ссылку' : 'Поделиться';
+  });
+  document.querySelectorAll('[data-download-pdf]').forEach((link) => {
+    const kind = link.dataset.downloadPdf;
+    const path = resultReports[kind]?.pdfPath;
+    const disabled = !path || Boolean(pendingPdf) || Boolean(pendingShare);
+    if (path) link.href = path;
+    else link.removeAttribute('href');
+    link.classList.toggle('is-disabled', disabled);
+    link.setAttribute('aria-disabled', String(disabled));
+    link.setAttribute('aria-busy', String(pendingPdf?.kind === kind));
+    link.tabIndex = disabled ? -1 : 0;
+  });
+}
+
+function reportApiPath(value, expectedPath) {
+  if (typeof value !== 'string') return null;
+  try {
+    const url = new URL(value, window.location.origin);
+    return url.origin === window.location.origin && url.pathname === expectedPath && !url.search && !url.hash ? url.pathname : null;
+  } catch (_) { return null; }
+}
+
+function setResultReport(kind, data) {
+  if (pendingShare?.kind === kind) {
+    pendingShare.controller.abort();
+    pendingShare = null;
+  }
+  if (pendingPdf?.kind === kind) {
+    pendingPdf.controller.abort();
+    pendingPdf = null;
+  }
+  const reportId = typeof data?.report_id === 'string' && /^[A-Za-z0-9_-]{1,200}$/.test(data.report_id) ? data.report_id : null;
+  resultReports[kind] = data ? {
+    reportId,
+    pdfPath: reportId ? reportApiPath(data.pdf_path, `/api/report-drafts/${encodeURIComponent(reportId)}/pdf`) : null,
+    publicUrl: null,
+    expiresAt: null,
+  } : null;
+  const status = shareStatus(kind);
+  if (status) {
+    status.replaceChildren();
+    status.hidden = true;
+    status.classList.remove('is-error');
+    if (data && !reportId) {
+      status.textContent = typeof data.report_error === 'string' ? data.report_error : 'Повторите анализ, чтобы создать ссылку на отчёт и скачать PDF.';
+      status.hidden = false;
+    }
+  }
+  refreshShareButtons();
+}
+
+function setReportStatus(kind, message, isError = false) {
+  const status = shareStatus(kind);
+  status.textContent = message;
+  status.hidden = !message;
+  status.classList.toggle('is-error', isError);
+}
+
+function showPublishedReport(kind, report, feedback, manualCopy = false) {
+  if (resultReports[kind] !== report || !report.publicUrl) return;
+  const status = shareStatus(kind);
+  status.replaceChildren();
+  status.classList.remove('is-error');
+  status.hidden = false;
+  const message = document.createElement('span');
+  message.className = 'share-feedback';
+  message.textContent = feedback;
+  const link = document.createElement('a');
+  link.className = 'share-url';
+  link.href = report.publicUrl;
+  link.target = '_blank';
+  link.rel = 'noopener noreferrer';
+  link.textContent = report.publicUrl;
+  status.append(message, link);
+  if (manualCopy) {
+    const field = document.createElement('input');
+    field.className = 'share-url-field';
+    field.type = 'url';
+    field.readOnly = true;
+    field.value = report.publicUrl;
+    field.setAttribute('aria-label', 'Ссылка на сохранённый отчёт');
+    status.append(field);
+    field.focus({ preventScroll: true });
+    field.select();
+  }
+  if (['localhost', '127.0.0.1', '[::1]'].includes(new URL(report.publicUrl).hostname)) {
+    const note = document.createElement('span');
+    note.className = 'share-help';
+    note.textContent = 'Это локальный адрес: ссылка открывается только на устройстве, где запущен AntiSlop.';
+    status.append(note);
+  }
+}
+
+async function copyReportUrl(url) {
+  if (!navigator.clipboard?.writeText) return false;
+  let timeout;
+  try {
+    await Promise.race([
+      navigator.clipboard.writeText(url),
+      new Promise((_, reject) => { timeout = window.setTimeout(() => reject(new Error('clipboard timeout')), 3000); }),
+    ]);
+    return true;
+  } catch (_) { return false; }
+  finally { window.clearTimeout(timeout); }
+}
+
+async function shareResult(event) {
+  if (!event.isTrusted || pendingShare) return;
+  const kind = event.currentTarget.dataset.shareResult;
+  const report = resultReports[kind];
+  if (!report?.reportId) return;
+  const request = { kind, report, controller: new AbortController() };
+  pendingShare = request;
+  refreshShareButtons();
+  const timeout = window.setTimeout(() => request.controller.abort(), 25000);
+  try {
+    if (!report.publicUrl) {
+      setReportStatus(kind, 'Создаём ссылку на сохранённый отчёт…');
+      const response = await fetch('/api/reports', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ report_id: report.reportId }),
+        signal: request.controller.signal,
+      });
+      let data = null;
+      try { data = await response.json(); } catch (_) { /* A failed response may not contain JSON. */ }
+      if (resultReports[kind] !== report) return;
+      if (!response.ok) throw new Error(typeof data?.detail === 'string' ? data.detail : 'Не удалось сохранить отчёт. Повторите попытку.');
+      if (typeof data?.path !== 'string' || !/^\/r\/[A-Za-z0-9_-]+$/.test(data.path)) throw new Error('Сервер не вернул ссылку на отчёт. Повторите анализ.');
+      const url = new URL(data.url || data.path, window.location.origin);
+      if (!['https:', 'http:'].includes(url.protocol) || url.username || url.password || url.pathname !== data.path || url.search || url.hash) throw new Error('Сервер вернул некорректную ссылку на отчёт.');
+      report.publicUrl = url.href;
+      report.expiresAt = data.expires_at || null;
+      const publicToken = data.path.slice('/r/'.length);
+      const publicPdfPath = reportApiPath(data.pdf_path, `/api/reports/${encodeURIComponent(publicToken)}/pdf`);
+      if (publicPdfPath) report.pdfPath = publicPdfPath;
+    }
+    window.clearTimeout(timeout);
+    if (resultReports[kind] !== report) return;
+    showPublishedReport(kind, report, 'Ссылка на отчёт создана.');
+    const copied = await copyReportUrl(report.publicUrl);
+    showPublishedReport(kind, report, copied ? 'Ссылка скопирована. Вставьте её в сообщение.' : 'Ссылка готова. Скопируйте её из поля ниже.', !copied);
+  } catch (error) {
+    if (resultReports[kind] !== report) return;
+    setReportStatus(kind, error.name === 'AbortError' ? 'Сервер слишком долго создаёт ссылку. Повторите попытку.' : error.message || 'Не удалось создать ссылку на отчёт.', true);
+  } finally {
+    window.clearTimeout(timeout);
+    if (pendingShare === request) pendingShare = null;
+    refreshShareButtons();
+  }
+}
+
+async function downloadReportPdf(event) {
+  event.preventDefault();
+  if (!event.isTrusted || pendingPdf) return;
+  const kind = event.currentTarget.dataset.downloadPdf;
+  const report = resultReports[kind];
+  if (!report?.pdfPath) return;
+  const request = { kind, report, controller: new AbortController() };
+  pendingPdf = request;
+  refreshShareButtons();
+  if (report.publicUrl) showPublishedReport(kind, report, 'Готовим PDF…');
+  else setReportStatus(kind, 'Готовим PDF…');
+  const timeout = window.setTimeout(() => request.controller.abort(), 30000);
+  try {
+    const response = await fetch(report.pdfPath, { signal: request.controller.signal });
+    if (!response.ok) {
+      let data = null;
+      try { data = await response.json(); } catch (_) { /* Keep a readable error for non-JSON responses. */ }
+      throw new Error(typeof data?.detail === 'string' ? data.detail : 'Не удалось скачать PDF. Повторите анализ и попробуйте ещё раз.');
+    }
+    if (!(response.headers.get('content-type') || '').includes('application/pdf')) throw new Error('Сервер не вернул PDF. Повторите попытку.');
+    const blob = await response.blob();
+    if (resultReports[kind] !== report) return;
+    if (!blob.size) throw new Error('Сервер вернул пустой PDF. Повторите попытку.');
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = kind === 'series' ? 'AntiSlop-series.pdf' : 'AntiSlop-report.pdf';
+    link.hidden = true;
+    document.body.append(link);
+    link.click();
+    link.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 60000);
+    if (report.publicUrl) showPublishedReport(kind, report, 'PDF подготовлен для скачивания.');
+    else setReportStatus(kind, 'PDF подготовлен для скачивания.');
+  } catch (error) {
+    if (resultReports[kind] !== report) return;
+    const message = error.name === 'AbortError' ? 'Подготовка PDF заняла слишком много времени. Повторите попытку.' : error.message || 'Не удалось скачать PDF.';
+    if (report.publicUrl) showPublishedReport(kind, report, message);
+    else setReportStatus(kind, message, true);
+  } finally {
+    window.clearTimeout(timeout);
+    if (pendingPdf === request) pendingPdf = null;
+    refreshShareButtons();
+  }
 }
 
 function updateManualSearchVisibility() {
@@ -387,6 +599,7 @@ function setBusy(busy) {
 }
 
 function clearReport() {
+  setResultReport('single', null);
   results.hidden = true;
   $('#visualAnalysis').hidden = true;
   $('#reportDetails').open = false;
@@ -851,6 +1064,7 @@ function renderResult(data) {
   renderApiResults(data);
   renderVision(data);
   renderForensics(data);
+  setResultReport('single', data);
   $('#reportDetails').open = false;
   results.hidden = false;
   setState('complete');
@@ -1012,6 +1226,33 @@ const seriesResults = $('#seriesResults');
 let seriesMode = false;
 let seriesBusy = false;
 let seriesFiles = [];
+let seriesRevision = 0;
+const seriesKindInputs = Array.from(document.querySelectorAll('input[name="seriesMode"]'));
+
+function invalidateSeriesReport() {
+  setResultReport('series', null);
+  seriesRevision += 1;
+  seriesResults.hidden = true;
+  if (!seriesBusy) {
+    setButtonLabel(seriesButton, seriesFiles.length === 1 ? 'Нужен ещё один снимок' : 'Проверить серию');
+    if (seriesMode) setState(seriesFiles.length >= 2 ? 'ready' : 'idle');
+  }
+}
+
+function setSeriesBusy(busy) {
+  seriesBusy = busy;
+  const controls = [seriesInput, $('#seriesPick'), $('#seriesRemote'), $('#singleTab'), $('#seriesTab'), $('#seriesNew'), ...seriesKindInputs, ...imagePickButtons, ...Array.from($('#seriesThumbs').querySelectorAll('button'))];
+  controls.forEach((control) => { control.disabled = busy; });
+  seriesButton.disabled = busy || seriesFiles.length < 2;
+  seriesButton.classList.toggle('is-busy', busy);
+  seriesButton.setAttribute('aria-busy', String(busy));
+  seriesDrop.setAttribute('aria-disabled', String(busy));
+  seriesDrop.setAttribute('aria-busy', String(busy));
+  seriesDrop.tabIndex = busy ? -1 : 0;
+  seriesDrop.classList.toggle('scanning', busy);
+  $('#seriesStatus').hidden = !busy;
+  imagePickButtons.forEach((button) => button.setAttribute('aria-disabled', String(busy)));
+}
 
 function setMode(series) {
   if (isAnalyzing || seriesBusy || seriesMode === series) return;
@@ -1041,13 +1282,17 @@ function setSeriesError(message) {
 }
 
 function addSeriesFiles(files) {
+  if (seriesBusy) return;
+  const previousCount = seriesFiles.length;
   const rejected = [];
   Array.from(files || []).forEach((file) => {
     if (!isSupportedFile(file)) rejected.push(`${file.name}: неподдерживаемый формат`);
+    else if (!file.size) rejected.push(`${file.name}: файл пустой`);
     else if (file.size > 20 * 1024 * 1024) rejected.push(`${file.name}: больше 20 МБ`);
     else if (seriesFiles.length >= MAX_SERIES) rejected.push(`${file.name}: не больше ${MAX_SERIES} снимков`);
     else seriesFiles.push(file);
   });
+  if (seriesFiles.length !== previousCount) invalidateSeriesReport();
   setSeriesError(rejected.join('\n'));
   renderSeriesThumbs();
 }
@@ -1056,6 +1301,7 @@ function removeSeriesFile(index) {
   if (seriesBusy) return;
   const [file] = seriesFiles.splice(index, 1);
   if (file?.previewUrl) URL.revokeObjectURL(file.previewUrl);
+  if (file) invalidateSeriesReport();
   setSeriesError('');
   renderSeriesThumbs();
 }
@@ -1114,13 +1360,31 @@ const PAIR_TEXT = {
 };
 
 function renderSeries(data) {
-  $('#seriesCard').className = `series-card ${data.verdict}`;
-  setText('#seriesVerdict', VERDICT_TEXT[data.verdict] || data.verdict || '—');
-  setText('#seriesHeadline', data.headline || '');
+  const consistency = data.consistency || {};
+  const verdict = consistency.verdict || data.verdict;
+  $('#seriesCard').className = `series-card ${verdict}`;
+  setText('#seriesVerdict', consistency.label || VERDICT_TEXT[verdict] || verdict || '—');
+  setText('#seriesHeadline', consistency.headline || data.headline || '');
+  setText('#seriesDetail', consistency.detail || '');
+  $('#seriesDetail').hidden = !consistency.detail;
   const count = Number(data.count) || 0;
   const meta = [`${count} ${plural(count, 'снимок', 'снимка', 'снимков')}`, `режим: ${data.mode === 'person' ? 'один человек' : 'одна сцена'}`];
+  if (Number.isFinite(consistency.checked_images) && Number.isFinite(consistency.total_images)) {
+    meta.push(`сопоставлено снимков: ${consistency.checked_images} из ${consistency.total_images}`);
+  }
   if (Number.isFinite(data.latency_ms)) meta.push(`сравнение ${(data.latency_ms / 1000).toFixed(1)} с`);
   setText('#seriesMeta', meta.join(' · '));
+
+  const ai = data.ai_assessment;
+  const aiCard = $('#seriesAiAssessment');
+  aiCard.hidden = !ai;
+  aiCard.className = `series-ai-assessment ${ai?.status || ''}`;
+  setText('#seriesAiHeadline', ai?.headline || '');
+  setText('#seriesAiDetail', ai?.detail || '');
+  const aiCoverage = Number.isFinite(ai?.checked_images) && Number.isFinite(ai?.total_images)
+    ? `Оценки получены для ${ai.checked_images} из ${ai.total_images} снимков.` : '';
+  setText('#seriesAiCoverage', aiCoverage);
+  $('#seriesAiCoverage').hidden = !aiCoverage;
 
   const actions = $('#seriesActions');
   actions.replaceChildren(...asArray(data.recommendations).map((text) => textElement('li', text)));
@@ -1176,8 +1440,11 @@ function renderSeries(data) {
       const row = document.createElement('div');
       row.className = 'face-pair';
       const pose = pair.pose_diff_deg !== null && pair.pose_diff_deg !== undefined ? ` · поворот головы ${pair.pose_diff_deg}°` : '';
+      const identity = pair.low_resolution ? 'сравнение ненадёжно: мелкое лицо'
+        : pair.same_person ? 'лица похожи'
+          : Number.isFinite(pair.cosine) && pair.cosine < 0.25 ? 'лица различаются' : 'сходство неоднозначно';
       row.append(
-        textElement('b', `Снимки ${pair.a + 1} и ${pair.b + 1}: ${pair.same_person ? 'тот же человек' : 'не совпадает'}`),
+        textElement('b', `Снимки ${pair.a + 1} и ${pair.b + 1}: ${identity}`),
         textElement('span', `сходство ${Number(pair.cosine).toFixed(2)} · идентичность пикселей ${Number(pair.face_ssim).toFixed(2)}${pose}`),
       );
       pairRoot.append(row);
@@ -1232,6 +1499,7 @@ function renderSeries(data) {
     return fact;
   }));
 
+  setResultReport('series', data);
   seriesResults.hidden = false;
   setState('complete');
   seriesResults.focus({ preventScroll: true });
@@ -1239,44 +1507,46 @@ function renderSeries(data) {
 }
 
 async function analyzeSeries() {
-  if (seriesBusy || seriesFiles.length < 2) return;
-  seriesBusy = true;
+  if (isAnalyzing || seriesBusy || seriesFiles.length < 2) return;
+  setResultReport('series', null);
+  const revision = seriesRevision;
+  const files = [...seriesFiles];
+  const mode = document.querySelector('input[name="seriesMode"]:checked')?.value || 'scene';
+  const remote = $('#seriesRemote').checked;
+  setSeriesBusy(true);
   setSeriesError('');
-  seriesButton.disabled = true;
-  seriesButton.classList.add('is-busy');
   setButtonLabel(seriesButton, 'Анализируем серию…');
-  $('#seriesStatus').hidden = false;
-  seriesDrop.classList.add('scanning');
   seriesResults.hidden = true;
   setState('analyzing');
   const controller = new AbortController();
   const timeout = window.setTimeout(() => controller.abort(), 180000);
   try {
     const form = new FormData();
-    seriesFiles.forEach((file) => form.append('files', file, file.name));
-    const mode = document.querySelector('input[name="seriesMode"]:checked')?.value || 'scene';
-    const remote = $('#seriesRemote').checked;
+    files.forEach((file) => form.append('files', file, file.name));
     const response = await fetch(`/api/analyze-set?mode=${mode}&remote=${remote}`, { method: 'POST', body: form, signal: controller.signal });
     let data = null;
     try { data = await response.json(); } catch { data = null; }
+    if (revision !== seriesRevision) return;
     if (!response.ok || !data) throw new Error(data?.detail || 'Не удалось проверить серию. Попробуйте ещё раз.');
     renderSeries(data);
   } catch (error) {
+    if (revision !== seriesRevision) return;
     setSeriesError(error.name === 'AbortError' ? 'Проверка серии заняла слишком много времени. Попробуйте меньше снимков.' : error.message || 'Ошибка проверки серии');
     setState(seriesFiles.length >= 2 ? 'ready' : 'idle');
   } finally {
     window.clearTimeout(timeout);
-    seriesBusy = false;
-    seriesButton.classList.remove('is-busy');
-    seriesButton.disabled = seriesFiles.length < 2;
-    setButtonLabel(seriesButton, 'Проверить ещё раз');
-    $('#seriesStatus').hidden = true;
-    seriesDrop.classList.remove('scanning');
+    setSeriesBusy(false);
+    setButtonLabel(seriesButton, revision === seriesRevision ? 'Проверить ещё раз' : 'Проверить серию');
+    if (revision !== seriesRevision) setState(seriesFiles.length >= 2 ? 'ready' : 'idle');
   }
 }
 
 $('#singleTab').addEventListener('click', () => setMode(false));
 $('#seriesTab').addEventListener('click', () => setMode(true));
+[...seriesKindInputs, $('#seriesRemote')].forEach((control) => control.addEventListener('change', () => {
+  invalidateSeriesReport();
+  setSeriesError('');
+}));
 $('#seriesPick').addEventListener('click', (event) => { event.stopPropagation(); if (!seriesBusy) seriesInput.click(); });
 seriesDrop.addEventListener('click', (event) => {
   if (seriesBusy) return;
@@ -1303,9 +1573,14 @@ $('#seriesNew').addEventListener('click', () => {
   if (seriesBusy) return;
   seriesFiles.forEach((file) => file.previewUrl && URL.revokeObjectURL(file.previewUrl));
   seriesFiles = [];
+  invalidateSeriesReport();
   setSeriesError('');
   renderSeriesThumbs();
   seriesResults.hidden = true;
   seriesDrop.focus({ preventScroll: true });
   $('#checker').scrollIntoView({ block: 'start', behavior: motionBehavior() });
 });
+
+document.querySelectorAll('[data-share-result]').forEach((button) => button.addEventListener('click', shareResult));
+document.querySelectorAll('[data-download-pdf]').forEach((link) => link.addEventListener('click', downloadReportPdf));
+refreshShareButtons();

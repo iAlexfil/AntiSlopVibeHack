@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="theme-color" content="#080c10">
+  <meta name="robots" content="noindex,nofollow">
+  <meta name="referrer" content="no-referrer">
+  <title>Сохранённый отчёт — AntiSlop</title>
+  <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/static/app.css?v=15">
+  <link rel="stylesheet" href="/static/shared-report.css?v=15">
+  <script src="/static/shared-report.js?v=15" defer></script>
+</head>
+<body class="saved-page">
+  <svg class="icon-definitions" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+    <symbol id="icon-share" viewBox="0 0 24 24"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><path d="m8.6 10.5 6.8-4m-6.8 7 6.8 4"/></symbol>
+    <symbol id="icon-download" viewBox="0 0 24 24"><path d="M12 3v12m-5-5 5 5 5-5M4 16v5h16v-5"/></symbol>
+  </svg>
+  <header class="saved-header page-width"><a class="wordmark" href="/" aria-label="AntiSlop — главная">ANTISLOP</a><a class="saved-home" href="/">Проверить изображение ↗</a></header>
+  <main class="saved-main page-width">
+    <section id="reportLoading" class="saved-state" role="status"><span class="progress-spinner" aria-hidden="true"></span><p>Загружаем сохранённый отчёт…</p></section>
+    <section id="reportError" class="saved-state" role="alert" hidden><p class="eyebrow">AntiSlop</p><h1 id="reportErrorTitle">Не удалось открыть отчёт</h1><p id="reportErrorDetail"></p><button id="retryReport" class="share-button" type="button">Повторить загрузку</button><a class="saved-home" href="/">Перейти к проверке ↗</a></section>
+    <article id="savedReport" hidden>
+      <div class="saved-heading"><div><p class="eyebrow">Сохранённый отчёт</p><h1 id="savedTitle"></h1><p id="savedDate" class="saved-date"></p></div><div class="saved-actions"><button id="copyReportLink" class="share-button" type="button"><svg class="icon" aria-hidden="true"><use href="#icon-share"/></svg><span>Копировать ссылку</span></button><a id="savedPdf" class="share-button" download><svg class="icon" aria-hidden="true"><use href="#icon-download"/></svg><span>Скачать PDF</span></a></div></div>
+      <div id="savedLinkStatus" class="share-status saved-link-status" role="status" hidden></div>
+      <section id="savedOverview" class="saved-overview"><div class="saved-overview-top"><strong id="savedLabel" class="saved-label"></strong><span id="savedScore" class="saved-score" hidden></span></div><h2 id="savedHeadline"></h2><p id="savedSummary"></p></section>
+      <section id="savedImagesSection" class="saved-section" hidden><h2>Изображения</h2><div id="savedImages" class="saved-images"></div></section>
+      <div id="savedSections"></div>
+    </article>
+  </main>
+  <footer class="saved-footer page-width"><a href="/">ANTISLOP</a><span>Сохранённый результат проверки</span></footer>
+</body>
+</html>

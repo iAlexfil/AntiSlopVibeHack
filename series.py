@@ -66,11 +66,82 @@ def _reason(level: str, polarity: int, title: str, detail: str) -> dict[str, Any
     return {"level": level, "polarity": polarity, "title": title, "detail": detail}
 
 
+def consistency_assessment(result: dict[str, Any], count: int) -> dict[str, Any]:
+    """Описывает сравнение кадров независимо от AI-оценок отдельных снимков."""
+    verdict = result.get("verdict", "insufficient")
+    person = result.get("mode") == "person"
+    pairs = result.get("pairs", [])
+    faces = result.get("faces") or {}
+    comparable = ([pair for pair in faces.get("pairs", []) if not pair.get("low_resolution")]
+                  if person else [pair for pair in pairs if pair.get("status") not in {"no_overlap", "weak"}])
+    checked = {pair[key] for pair in comparable for key in ("a", "b") if key in pair}
+    assessment = {
+        "verdict": verdict, "kind": verdict, "label": "", "headline": "", "detail": "",
+        "checked_images": len(checked), "total_images": count,
+        "checked_pairs": len(comparable), "total_pairs": count * (count - 1) // 2,
+    }
+    if verdict == "consistent":
+        assessment.update(
+            label="Один и тот же человек" if person else "Ракурсы согласованы",
+            headline="Лица на снимках совпадают" if person else "Снимки связаны общей геометрией",
+            detail="Сравнение лиц выполнено для всех снимков." if person else "Все снимки связаны геометрически согласованными парами.",
+        )
+    elif verdict == "inconsistent":
+        assessment.update(label="Найдены расхождения", headline="Есть противоречия между снимками",
+                          detail="Ниже показаны пары и признаки, на которых обнаружены расхождения.")
+    elif person:
+        found = [face for face in faces.get("faces", []) if face]
+        if len(found) < count:
+            assessment.update(kind="faces_missing", label="Не на всех кадрах видно лицо",
+                              headline=f"Лицо найдено на {len(found)} из {count} снимков",
+                              detail="Для сравнения нужен один человек с хорошо видимым лицом на каждом снимке.")
+        elif any(face.get("low_resolution") for face in found):
+            assessment.update(kind="faces_small", label="Лица слишком мелкие",
+                              headline="Часть лиц не удалось надёжно сравнить",
+                              detail="Добавьте более крупные портреты без сильного размытия. Менять фон не требуется.")
+        else:
+            assessment.update(kind="identity_uncertain", label="Сходство лиц неоднозначно",
+                              headline="Не все лица удалось уверенно сопоставить",
+                              detail="Попробуйте чёткие снимки одного человека с небольшим поворотом головы.")
+    else:
+        statuses = {pair.get("status") for pair in pairs}
+        if statuses == {"near_duplicate"}:
+            assessment.update(kind="near_duplicate", label="Кадры почти одинаковые",
+                              headline="Изображения совпадают, но нового ракурса нет",
+                              detail="Сместитесь в сторону при съёмке, сохранив общие предметы в кадре.")
+        elif statuses and statuses <= {"planar", "near_duplicate"}:
+            assessment.update(kind="planar", label="Общие детали найдены",
+                              headline="Для проверки объёма не хватает смещения камеры",
+                              detail="Совпадения объясняются плоской поверхностью или поворотом на месте. Нужен ракурс со смещением в сторону.")
+        elif any(pair.get("status") == "consistent_3d" for pair in pairs):
+            assessment.update(kind="partial", label="Согласована часть серии",
+                              headline="Не все снимки удалось связать между собой",
+                              detail="Посмотрите пары ниже: добавьте промежуточный ракурс между несвязанными снимками.")
+        elif statuses == {"no_overlap"}:
+            assessment.update(kind="no_overlap", label="Общих деталей не найдено",
+                              headline="Не удалось сопоставить содержимое снимков",
+                              detail="Нужны снимки с перекрытием: одни и те же предметы должны быть видны на нескольких кадрах.")
+        else:
+            assessment.update(kind="weak", label="Совпадений недостаточно для геометрии",
+                              headline="Общие детали не дали надёжного сравнения ракурсов",
+                              detail="Попробуйте более чёткие кадры с меньшей разницей ракурсов и общими предметами.")
+    return assessment
+
+
 def finalize(series: dict[str, Any], images: list[dict[str, Any]], face_background: list[dict[str, Any]]) -> dict[str, Any]:
     """Добавляет к вердикту воркера сигналы отдельных снимков и рекомендации действий."""
     reasons = list(series.get("reasons", []))
     scored = [image for image in images if image.get("percent") is not None]
     flagged = [image for image in scored if image["percent"] >= AI_THRESHOLD]
+    consistency = consistency_assessment(series, series.get("count", len(images)))
+    ai_assessment = {
+        "status": "flagged" if flagged else "not_flagged" if scored else "unavailable",
+        "headline": (f"Признаки ИИ на {len(flagged)} из {len(scored)} снимков" if flagged else
+                     "Высоких оценок ИИ не получено" if scored else "Оценки ИИ недоступны"),
+        "detail": ("Оценки отдельных снимков показаны ниже. Они не меняют результат сравнения ракурсов или лиц."
+                   if scored else "Детекторы не вернули численные оценки. Сравнение кадров показано отдельно."),
+        "flagged_images": len(flagged), "checked_images": len(scored), "total_images": len(images),
+    }
     verdict = series.get("verdict", "insufficient")
     headline = series.get("headline", "")
     if flagged:
@@ -95,8 +166,9 @@ def finalize(series: dict[str, Any], images: list[dict[str, Any]], face_backgrou
                 f"Модель считает AI скорее {part} (лицо {item['face']:.0%}, фон {item['background']:.0%}). Возможен коллаж или вклейка; сигнал слабый — модель обучена на целых кадрах.",
             ))
     return {**series, "verdict": verdict, "headline": headline, "reasons": reasons,
+            "consistency": consistency, "ai_assessment": ai_assessment,
             "images": images, "face_background": face_background,
-            "recommendations": recommendations(series.get("mode", "scene"), verdict, series)}
+            "recommendations": recommendations(series.get("mode", "scene"), consistency["verdict"], series)}
 
 
 def recommendations(mode: str, verdict: str, series: dict[str, Any]) -> list[str]:
@@ -118,7 +190,8 @@ def recommendations(mode: str, verdict: str, series: dict[str, Any]) -> list[str
         actions.append("Кадры почти одинаковые: попросите снять объект, сместившись на 1–2 шага в сторону.")
     if "planar" in statuses:
         actions.append("Сцена выглядит плоской: убедитесь, что это не съёмка экрана или распечатки — попросите ракурс сбоку.")
-    if mode == "person" and not any(face for face in (series.get("faces") or {}).get("faces", [])):
-        actions.append("Лица не найдены: нужны снимки, где лицо видно крупно и анфас.")
-    actions.append("Добавьте ещё 1–2 снимка той же сцены с заметно другого ракурса.")
+    if mode == "person":
+        return ["Добавьте чёткие снимки того же человека с крупным лицом и небольшим поворотом головы.",
+                "Если в кадре несколько людей, выберите снимки, где нужный человек один."]
+    actions.append("Добавьте ещё 1–2 снимка той же сцены с заметно другого ракурса и общими предметами в кадре.")
     return actions

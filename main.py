@@ -2,16 +2,19 @@ from __future__ import annotations
 
 import asyncio
 import io
+import os
 import re
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import numpy as np
 from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from PIL import ExifTags, Image, UnidentifiedImageError
 from dotenv import load_dotenv
+from pydantic import BaseModel, Field as SchemaField
 
 from forensics import run_forensics
 from local_model import run_local_model, run_multiview
@@ -27,9 +30,98 @@ MAX_IMAGE_PIXELS = 40_000_000
 
 load_dotenv(ROOT / ".env")
 
+import shared_reports
+from report_pdf import render_pdf
+
 app = FastAPI(title="AntiSlop", version="0.2.0")
 app.mount("/static", StaticFiles(directory=STATIC), name="static")
 LOCAL_MODEL_GATE = asyncio.Semaphore(1)
+REPORT_PDF_GATE = asyncio.Semaphore(1)
+REPORT_SAVE_GATE = asyncio.Semaphore(1)
+REPORT_HEADERS = {"Cache-Control": "no-store", "X-Robots-Tag": "noindex, nofollow", "Referrer-Policy": "no-referrer"}
+
+
+class PublishReport(BaseModel):
+    report_id: str = SchemaField(min_length=32, max_length=128, pattern=r"^[A-Za-z0-9_-]+$")
+
+
+async def _attach_report(result: dict[str, Any], kind: str, images: list[bytes]) -> dict[str, Any]:
+    try:
+        async with REPORT_SAVE_GATE:
+            report_id = await asyncio.to_thread(shared_reports.create_draft, kind, result, images)
+    except (shared_reports.ReportStoreError, OSError, ValueError):
+        result["report_error"] = "Не удалось сохранить отчёт для ссылки и PDF. Результат анализа доступен; повторите проверку позже."
+    else:
+        result["report_id"] = report_id
+        result["pdf_path"] = f"/api/report-drafts/{report_id}/pdf"
+    return result
+
+
+def _public_report_base() -> str:
+    base = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
+    if not base:
+        return ""
+    try:
+        parsed = urlsplit(base)
+        parsed.port
+    except ValueError as error:
+        raise HTTPException(503, "В PUBLIC_BASE_URL указан некорректный адрес") from error
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc or parsed.username or parsed.password or parsed.query or parsed.fragment or parsed.path:
+        raise HTTPException(503, "Проверьте PUBLIC_BASE_URL: нужен адрес сервиса без пути и параметров")
+    return base
+
+
+async def _saved_report(token: str, *, draft: bool = False) -> dict[str, Any]:
+    try:
+        return await asyncio.to_thread(shared_reports.get_draft if draft else shared_reports.get_public, token)
+    except shared_reports.ReportNotFound as error:
+        raise HTTPException(404, "Отчёт не найден или срок его хранения истёк") from error
+    except shared_reports.ReportStoreError as error:
+        raise HTTPException(503, "Хранилище отчётов временно недоступно") from error
+
+
+@app.post("/api/reports", status_code=201)
+async def publish_report(body: PublishReport) -> JSONResponse:
+    base = _public_report_base()
+    try:
+        published = await asyncio.to_thread(shared_reports.publish, body.report_id)
+    except shared_reports.ReportNotFound as error:
+        raise HTTPException(404, "Отчёт больше не доступен. Выполните проверку ещё раз") from error
+    except shared_reports.ReportStoreError as error:
+        raise HTTPException(503, "Не удалось создать ссылку. Попробуйте позже") from error
+    if base:
+        published["url"] = base + published["path"]
+    return JSONResponse(published, status_code=201, headers=REPORT_HEADERS)
+
+
+@app.get("/api/reports/{token}")
+async def saved_report(token: str) -> JSONResponse:
+    return JSONResponse(await _saved_report(token), headers=REPORT_HEADERS)
+
+
+async def _pdf_response(token: str, *, draft: bool = False) -> Response:
+    async with REPORT_PDF_GATE:
+        document = await _saved_report(token, draft=draft)
+        try:
+            pdf = await asyncio.to_thread(render_pdf, document)
+        except Exception as error:
+            raise HTTPException(503, "Не удалось подготовить PDF. Попробуйте позже") from error
+    return Response(pdf, media_type="application/pdf", headers={**REPORT_HEADERS, "Content-Disposition": 'attachment; filename="antislop-report.pdf"'})
+
+
+@app.get("/api/reports/{token}/pdf")
+async def public_report_pdf(token: str) -> Response:
+    return await _pdf_response(token)
+
+
+@app.get("/api/report-drafts/{report_id}/pdf")
+async def private_report_pdf(report_id: str) -> Response:
+    return await _pdf_response(report_id, draft=True)
+
+
+@app.get("/r/{token}")
+async def shared_report_page(token: str) -> FileResponse:
+    return FileResponse(STATIC / "shared-report.html", headers=REPORT_HEADERS)
 
 
 PROVIDER_MARKERS: dict[str, tuple[str, ...]] = {
@@ -287,7 +379,7 @@ async def analyze(request: Request, filename: str = "image", remote: bool = True
     data = await _read_limited_body(request)
     mime_type = request.headers.get("content-type", "application/octet-stream").split(";", 1)[0]
     result = await run_pipeline(data, filename, mime_type, remote)
-    return JSONResponse(result)
+    return JSONResponse(await _attach_report(result, "single", [data]))
 
 
 async def _run_multiview_limited(items: list[tuple[str, bytes]], mode: str) -> dict[str, Any]:
@@ -345,7 +437,8 @@ async def analyze_set(
         if len(data) > MAX_FILE_SIZE:
             raise HTTPException(413, f"Снимок {index + 1} больше 20 МБ")
         items.append((upload.filename or f"image-{index + 1}", data, upload.content_type or "application/octet-stream"))
-    return JSONResponse(await run_series(items, mode, remote))
+    result = await run_series(items, mode, remote)
+    return JSONResponse(await _attach_report(result, "series", [data for _, data, _ in items]))
 
 
 @app.exception_handler(HTTPException)

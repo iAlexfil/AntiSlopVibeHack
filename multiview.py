@@ -545,7 +545,8 @@ def series_verdict(mode: str, count: int, pairs: list[dict[str, Any]], exif: dic
                 reasons.append(_reason("strong", -1, f"{name}: лицо будто вклеено", f"На разных фонах лицо почти пиксель в пиксель совпадает (SSIM {pair['face_ssim']:.2f}, поворот головы отличается на {pair['pose_diff_deg']}°). У живого человека в разных сценах выражение и ракурс меняются."))
                 strong_negative = True
         valid = [pair for pair in faces["pairs"] if not pair["low_resolution"]]
-        identity_ok = len(found) == count and bool(valid) and all(pair["same_person"] for pair in valid)
+        compared = {pair[key] for pair in valid for key in ("a", "b")}
+        identity_ok = len(found) == count and len(compared) == count and bool(valid) and all(pair["same_person"] for pair in valid)
         if identity_ok:
             reasons.append(_reason("weak", 1, "Один и тот же человек", "Лица на всех снимках совпадают. Это не доказывает реальность: AI-персонажи тоже бывают согласованными."))
 

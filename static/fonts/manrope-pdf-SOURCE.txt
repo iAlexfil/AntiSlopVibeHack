@@ -1,0 +1,20 @@
+Manrope PDF font assets
+======================
+
+manrope-pdf-regular.ttf and manrope-pdf-semibold.ttf are static instances
+(wght=400 and wght=600) derived from the existing manrope-latin.woff2 and
+manrope-cyrillic.woff2, with both subsets merged for PDF embedding.
+
+License: SIL Open Font License 1.1, see Manrope-OFL.txt in this directory.
+The source font copyright and license metadata are preserved in both TTFs:
+Copyright 2019 The Manrope Project Authors
+(https://github.com/sharanda/manrope).
+
+Generated with fontTools 4.67.0 and Brotli 1.2.1. These are build-time tools,
+not runtime dependencies. For each weight, instantiateVariableFont(...,
+{'wght': weight}, inplace=True) was called on each WOFF2, font.flavor was
+set to None, and the saved TTFs were merged using fontTools.merge.Merger.
+Static family/style/PostScript names were set to Manrope PDF Regular and
+Manrope PDF Semibold so PDF renderers distinguish both embedded weights.
+The generated assets contain 317 Unicode mappings including Latin,
+Cyrillic, punctuation, and digits. No network font loading is used.

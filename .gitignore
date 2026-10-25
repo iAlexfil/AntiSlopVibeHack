@@ -1,5 +1,6 @@
 .env
 .antislop-auth/
+.antislop-reports/
 .venv/
 .idea/
 .agents/
