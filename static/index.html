@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="AntiSlop — проверка изображений на признаки генерации искусственным интеллектом">
+  <title>AntiSlop — AI image detector</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <header class="site-header">
+    <a class="brand" href="#" aria-label="AntiSlop — на главную"><span class="brand-mark">AS</span><span>AntiSlop</span></a>
+    <div class="header-state"><i></i><span>Локальный анализ включён</span></div>
+  </header>
+
+  <main>
+    <section class="intro">
+      <div class="intro-copy">
+        <span class="eyebrow">IMAGE AUTHENTICITY CHECK</span>
+        <h1>Это фото<br><em>сделал ИИ?</em></h1>
+        <p>Одна проверка объединяет локальную модель, метаданные, вотермарки, пиксельную криминалистику и подключённые API.</p>
+      </div>
+      <div class="intro-aside"><span>Результат</span><strong>1 число</strong><p>И понятная расшифровка каждого сигнала — без технической каши на первом экране.</p></div>
+    </section>
+
+    <section class="upload-shell" aria-label="Загрузка изображения">
+      <div id="dropzone" class="dropzone" tabindex="0" role="button" aria-label="Выбрать изображение">
+        <input id="fileInput" type="file" accept="image/png,image/jpeg,image/webp,image/gif,image/tiff,image/bmp" hidden>
+        <div id="emptyState" class="drop-empty">
+          <span class="upload-symbol" aria-hidden="true">↗</span>
+          <div><h2>Перетащи изображение сюда</h2><p>или <button id="pickButton" type="button">выбери файл</button> · также работает Ctrl/⌘ + V</p></div>
+          <small>PNG · JPEG · WEBP · GIF · TIFF · BMP / до 20 МБ</small>
+        </div>
+        <div id="previewState" class="preview-state" hidden>
+          <img id="preview" alt="Выбранное изображение"><div class="preview-shade"></div><div id="fileBadge" class="file-badge"></div>
+          <button id="removeButton" class="remove-button" type="button" aria-label="Убрать изображение">×</button><div class="scan-line"></div>
+        </div>
+      </div>
+      <div class="upload-actions">
+        <label class="remote-toggle"><input id="useRemote" type="checkbox" checked><span class="toggle-ui"></span><span><b>Внешние детекторы</b><small>Отправлять только в API с настроенными ключами</small></span></label>
+        <button id="analyzeButton" class="analyze-button" type="button" disabled><span>Проверить изображение</span><i>→</i></button>
+      </div>
+    </section>
+
+    <section class="services-strip" aria-label="Статус детекторов">
+      <div class="services-title"><span>Доступные источники</span><small>Ключи остаются на сервере</small></div>
+      <div id="providerStatus" class="provider-status"><span class="loading-copy">Проверяем конфигурацию…</span></div>
+    </section>
+
+    <section id="results" class="results" hidden aria-live="polite">
+      <div class="results-heading"><div><span class="eyebrow">РЕЗУЛЬТАТ ПРОВЕРКИ</span><h2>Итоговая вероятность</h2></div><button id="newCheck" class="secondary-button" type="button">Проверить другую</button></div>
+
+      <article id="scoreCard" class="score-card unknown">
+        <div class="score-preview"><img id="resultPreview" alt="Проверенное изображение"></div>
+        <div class="score-copy"><span id="resultLabel" class="score-label">Оценка</span><h3 id="resultHeadline">Анализ завершён</h3><p id="resultSummary"></p><div id="scoreBasis" class="score-basis"></div></div>
+        <div class="score-number"><strong id="probabilityValue">—</strong><span>вероятность AI</span></div>
+        <div class="score-meter"><span id="probabilityFill"></span></div>
+      </article>
+
+      <section class="breakdown-section">
+        <div class="section-heading"><div><span class="eyebrow">РАЗБИВКА ОЦЕНКИ</span><h2>Что повлияло на результат</h2></div><p>Проценты показывают силу каждого отдельного сигнала. Они не обязаны совпадать с итогом.</p></div>
+        <div id="breakdownGrid" class="breakdown-grid"></div>
+      </section>
+
+      <details id="reportDetails" class="report-details">
+        <summary><span><small>FULL FORENSIC REPORT</small><b>Развернуть подробный отчёт</b></span><i aria-hidden="true">+</i></summary>
+        <div class="report-body">
+          <section class="report-overview">
+            <div class="report-block"><h3>Найденные признаки</h3><div id="findings"></div></div>
+            <div class="report-block"><h3>Данные файла</h3><div id="fileFacts" class="file-facts"></div><details class="metadata-details"><summary>Метаданные файла</summary><div id="metadata" class="metadata"></div></details></div>
+          </section>
+          <section class="report-block detector-report"><div class="report-block-head"><div><span class="eyebrow">DETECTOR RESPONSES</span><h3>Ответы моделей и сервисов</h3></div><div id="apiConsensus" class="api-consensus"></div></div><div id="apiResults" class="api-results"></div></section>
+          <section class="report-block forensic-report">
+            <div class="report-block-head"><div><span class="eyebrow">LOCAL FORENSICS</span><h3>Пиксельная лаборатория</h3></div><div id="resourceBudget" class="resource-budget"></div></div>
+            <div id="forensicSignals" class="forensic-signals"></div><div id="forensicMaps" class="forensic-maps"></div>
+            <div class="forensic-details"><div><h4>C2PA / Content Credentials</h4><div id="c2paResult"></div></div><div><h4>Проверка EXIF</h4><div id="exifChecks"></div></div><div><h4>Цифровые отпечатки</h4><div id="hashes"></div></div></div>
+          </section>
+        </div>
+      </details>
+
+      <div class="disclaimer"><span>!</span><p><b>Процент — скрининговая оценка, а не доказательство.</b> Модели ошибаются, метаданные удаляются, а реальные фотографии можно сильно обработать. Для важных решений проверяй источник и контекст.</p></div>
+    </section>
+  </main>
+
+  <footer><span>ANTISLOP / 2026</span><span>Локальная модель · C2PA · Forensics · API consensus</span></footer>
+  <script src="/static/app.js"></script>
+</body>
+</html>

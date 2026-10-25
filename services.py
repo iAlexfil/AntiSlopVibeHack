@@ -1,0 +1,496 @@
+from __future__ import annotations
+
+import asyncio
+import base64
+import io
+import json
+import os
+import time
+from collections.abc import Awaitable, Callable
+from typing import Any
+
+import httpx
+from PIL import Image
+
+
+ProviderResult = dict[str, Any]
+ProviderCall = Callable[[httpx.AsyncClient, bytes, str, str], Awaitable[ProviderResult]]
+
+TIMEOUT_SECONDS = 25.0
+
+PROVIDER_CATALOG = (
+    {
+        "id": "openai_vision",
+        "name": "OpenAI Vision",
+        "env": ("OPENAI_API_KEY",),
+        "docs": "https://developers.openai.com/api/docs/guides/images-vision",
+    },
+    {
+        "id": "hive",
+        "name": "Hive",
+        "env": ("HIVE_API_KEY",),
+        "docs": "https://docs.thehive.ai/reference/ai-generated-image-and-video-detection-1",
+    },
+    {
+        "id": "sightengine",
+        "name": "Sightengine",
+        "env": ("SIGHTENGINE_API_USER", "SIGHTENGINE_API_SECRET"),
+        "docs": "https://sightengine.com/docs/ai-generated-image-detection",
+    },
+    {
+        "id": "aiornot",
+        "name": "AI or Not",
+        "env": ("AIORNOT_API_KEY",),
+        "docs": "https://docs.aiornot.com/api-reference/reports-by-modality/image",
+    },
+    {
+        "id": "wasitai",
+        "name": "WasItAI",
+        "env": ("WASITAI_API_KEY",),
+        "docs": "https://wasitai.com/api/documentation",
+    },
+    {
+        "id": "illuminarty",
+        "name": "Illuminarty",
+        "env": (),
+        "docs": "https://illuminarty.ai/",
+        "unavailable": "Нет публичного контракта API — доступ выдаётся по договорённости.",
+    },
+    {
+        "id": "synthid",
+        "name": "Google SynthID",
+        "env": (),
+        "docs": "https://deepmind.google/science/synthid/",
+        "unavailable": "Публичного API детектора изображений нет.",
+    },
+)
+
+
+def provider_catalog() -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    for provider in PROVIDER_CATALOG:
+        required = provider["env"]
+        configured = bool(required) and all(os.getenv(key) for key in required)
+        result.append({
+            "id": provider["id"],
+            "name": provider["name"],
+            "configured": configured,
+            "docs": provider["docs"],
+            "required_env": list(required),
+            "unavailable": provider.get("unavailable"),
+        })
+    return result
+
+
+def _best_generator(generators: dict[str, Any] | None) -> str | None:
+    if not generators:
+        return None
+    scores: list[tuple[str, float]] = []
+    for name, value in generators.items():
+        if isinstance(value, dict):
+            value = value.get("confidence", 0)
+        if isinstance(value, (int, float)):
+            scores.append((name, float(value)))
+    if not scores:
+        return None
+    name, score = max(scores, key=lambda item: item[1])
+    return name.replace("_", " ") if score >= 0.2 else None
+
+
+def _normalized(name: str, score: float, generator: str | None = None, detail: str | None = None) -> ProviderResult:
+    score = max(0.0, min(1.0, float(score)))
+    return {
+        "name": name,
+        "status": "ok",
+        "score": round(score, 4),
+        "verdict": "ai" if score >= 0.5 else "human",
+        "generator": generator,
+        "detail": detail or ("Вероятно AI" if score >= 0.5 else "Вероятно оригинал"),
+    }
+
+
+def _vision_data_url(data: bytes) -> str:
+    """Bound request size/cost; semantic analysis does not need the full-resolution file."""
+    with Image.open(io.BytesIO(data)) as image:
+        preview = image.convert("RGB")
+        preview.thumbnail((1280, 1280), Image.Resampling.LANCZOS)
+        output = io.BytesIO()
+        preview.save(output, "JPEG", quality=86, optimize=True)
+    encoded = base64.b64encode(output.getvalue()).decode("ascii")
+    return f"data:image/jpeg;base64,{encoded}"
+
+
+def _response_output_text(payload: dict[str, Any]) -> str:
+    for item in payload.get("output") or []:
+        if item.get("type") != "message":
+            continue
+        for content in item.get("content") or []:
+            if content.get("type") == "output_text" and content.get("text"):
+                return str(content["text"])
+    raise ValueError("OpenAI Vision не вернул текстовый результат")
+
+
+async def _openai_vision(client: httpx.AsyncClient, data: bytes, filename: str, mime_type: str) -> ProviderResult:
+    del filename, mime_type
+    model = os.getenv("OPENAI_VISION_MODEL", "gpt-6-luna")
+    schema = {
+        "type": "object",
+        "properties": {
+            "probability": {"type": "integer", "minimum": 0, "maximum": 100},
+            "assessment": {"type": "string", "enum": ["likely_ai", "uncertain", "likely_real"]},
+            "summary": {"type": "string"},
+            "signals": {"type": "array", "items": {"type": "string"}},
+        },
+        "required": ["probability", "assessment", "summary", "signals"],
+        "additionalProperties": False,
+    }
+    response = await client.post(
+        "https://api.openai.com/v1/responses",
+        headers={
+            "Authorization": f"Bearer {os.environ['OPENAI_API_KEY']}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": model,
+            "store": False,
+            "max_output_tokens": 350,
+            "input": [{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": (
+                            "Оцени вероятность того, что изображение полностью сгенерировано или существенно "
+                            "изменено генеративным ИИ. Анализируй семантические противоречия, анатомию, "
+                            "физику, повторения, текст и согласованность мелких деталей. Не считай сюрреалистичный "
+                            "сюжет сам по себе доказательством: он может быть постановкой, рисунком или фотомонтажом. "
+                            "Верни калиброванную вероятность и краткие наблюдаемые причины на русском."
+                        ),
+                    },
+                    {"type": "input_image", "image_url": _vision_data_url(data), "detail": "high"},
+                ],
+            }],
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": "image_authenticity",
+                    "strict": True,
+                    "schema": schema,
+                }
+            },
+        },
+    )
+    response.raise_for_status()
+    analysis = json.loads(_response_output_text(response.json()))
+    probability = int(analysis["probability"])
+    signals = [str(item) for item in analysis.get("signals") or []][:3]
+    detail = str(analysis["summary"])
+    if signals:
+        detail += " · " + "; ".join(signals)
+    result = _normalized("OpenAI Vision", probability / 100, detail=detail[:520])
+    result["model"] = model
+    result["semantic"] = True
+    return result
+
+
+async def _hive(client: httpx.AsyncClient, data: bytes, filename: str, mime_type: str) -> ProviderResult:
+    response = await client.post(
+        "https://api.thehive.ai/api/v2/task/sync",
+        headers={"Authorization": f"Token {os.environ['HIVE_API_KEY']}"},
+        files={"media": (filename, data, mime_type)},
+    )
+    response.raise_for_status()
+    payload = response.json()
+    entries = payload.get("status") or []
+    output = (((entries[0] if entries else {}).get("response") or {}).get("output") or [{}])[0]
+    classes = output.get("classes") or []
+    scores = {item.get("class"): float(item.get("score", 0)) for item in classes if item.get("class")}
+    score = scores.get("ai_generated", 0.0)
+    ignored = {"ai_generated", "not_ai_generated", "none", "inconclusive", "inconclusive_video", "deepfake"}
+    sources = {name: value for name, value in scores.items() if name not in ignored}
+    return _normalized("Hive", score, _best_generator(sources))
+
+
+async def _sightengine(client: httpx.AsyncClient, data: bytes, filename: str, mime_type: str) -> ProviderResult:
+    response = await client.post(
+        "https://api.sightengine.com/1.0/check.json",
+        data={
+            "models": "genai",
+            "api_user": os.environ["SIGHTENGINE_API_USER"],
+            "api_secret": os.environ["SIGHTENGINE_API_SECRET"],
+        },
+        files={"media": (filename, data, mime_type)},
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if payload.get("status") != "success":
+        raise ValueError("Sightengine вернул статус failure")
+    result = payload.get("type") or {}
+    return _normalized(
+        "Sightengine",
+        float(result.get("ai_generated", 0)),
+        _best_generator(result.get("ai_generators")),
+    )
+
+
+async def _aiornot(client: httpx.AsyncClient, data: bytes, filename: str, mime_type: str) -> ProviderResult:
+    response = await client.post(
+        "https://api.aiornot.com/v2/image/sync",
+        headers={"Authorization": f"Bearer {os.environ['AIORNOT_API_KEY']}"},
+        params={"only": "ai_generated"},
+        files={"image": (filename, data, mime_type)},
+    )
+    response.raise_for_status()
+    report = (response.json().get("report") or {}).get("ai_generated") or {}
+    ai = report.get("ai") or {}
+    score = float(ai.get("confidence", 0))
+    verdict = report.get("verdict")
+    if verdict == "unknown":
+        result = _normalized("AI or Not", score, _best_generator(report.get("generator")), "Сервис не уверен")
+        result["verdict"] = "unknown"
+        return result
+    return _normalized("AI or Not", score, _best_generator(report.get("generator")))
+
+
+async def _wasitai(client: httpx.AsyncClient, data: bytes, filename: str, mime_type: str) -> ProviderResult:
+    response = await client.post(
+        "https://api.wasitai.com/live/api/classifiers/v1/image/classify/upload-file",
+        headers={"api-key": os.environ["WASITAI_API_KEY"]},
+        files={"file": (filename, data, mime_type)},
+    )
+    response.raise_for_status()
+    classified = response.json().get("classifiedImage") or {}
+    if classified.get("status") == "error":
+        status = classified.get("statusInfo") or {}
+        raise ValueError(status.get("description") or "WasItAI не смог обработать изображение")
+    basic = classified.get("classifyResult") or {}
+    is_ai = classified.get("finalVerdictWasItAI")
+    if is_ai is None:
+        is_ai = basic.get("result") == "ai"
+    confidence = classified.get("finalVerdictConfidenceScore")
+    if confidence is None:
+        confidence = basic.get("confidenceScore", 0)
+    confidence = float(confidence) / 100
+    score = confidence if is_ai else 1 - confidence
+    detail = classified.get("finalVerdictHumanFriendlyDescription") or basic.get("humanFriendlyDescription")
+    return _normalized("WasItAI", score, detail=detail)
+
+
+RUNNERS: dict[str, ProviderCall] = {
+    "openai_vision": _openai_vision,
+    "hive": _hive,
+    "sightengine": _sightengine,
+    "aiornot": _aiornot,
+    "wasitai": _wasitai,
+}
+
+
+async def _run_one(
+    provider_id: str,
+    runner: ProviderCall,
+    client: httpx.AsyncClient,
+    data: bytes,
+    filename: str,
+    mime_type: str,
+) -> ProviderResult:
+    started = time.monotonic()
+    name = next(item["name"] for item in PROVIDER_CATALOG if item["id"] == provider_id)
+    try:
+        result = await runner(client, data, filename, mime_type)
+        result["latency_ms"] = round((time.monotonic() - started) * 1000)
+        result["id"] = provider_id
+        return result
+    except (httpx.HTTPError, ValueError, KeyError, TypeError) as error:
+        return {
+            "id": provider_id,
+            "name": name,
+            "status": "error",
+            "detail": str(error)[:240] or "Ошибка API",
+            "latency_ms": round((time.monotonic() - started) * 1000),
+        }
+
+
+async def analyze_with_services(data: bytes, filename: str, mime_type: str) -> list[ProviderResult]:
+    configured = {item["id"] for item in provider_catalog() if item["configured"]}
+    async with httpx.AsyncClient(timeout=TIMEOUT_SECONDS, follow_redirects=False) as client:
+        tasks = [
+            _run_one(provider_id, runner, client, data, filename, mime_type)
+            for provider_id, runner in RUNNERS.items()
+            if provider_id in configured
+        ]
+        completed = await asyncio.gather(*tasks) if tasks else []
+
+    by_id = {item["id"]: item for item in completed}
+    results: list[ProviderResult] = []
+    for provider in provider_catalog():
+        provider_id = provider["id"]
+        if provider_id in by_id:
+            results.append(by_id[provider_id])
+        elif provider.get("unavailable"):
+            results.append({
+                "id": provider_id,
+                "name": provider["name"],
+                "status": "unavailable",
+                "detail": provider["unavailable"],
+            })
+        else:
+            results.append({
+                "id": provider_id,
+                "name": provider["name"],
+                "status": "not_configured",
+                "detail": "Добавьте ключи в .env",
+            })
+    return results
+
+
+def merge_service_results(local: dict[str, Any], api_results: list[ProviderResult]) -> dict[str, Any]:
+    successful = [item for item in api_results if item.get("status") == "ok" and item.get("verdict") != "unknown"]
+    failed = [item for item in api_results if item.get("status") == "error"]
+    scores = [float(item["score"]) for item in successful]
+    provenance_score: float | None = None
+    finding_kinds = {item.get("kind") for item in local.get("findings", []) if item.get("level") == "strong"}
+    if "c2pa_generative" in finding_kinds:
+        provenance_score = 0.99
+    elif finding_kinds & {"provider", "generation_metadata"}:
+        provenance_score = 0.95
+
+    probability_inputs = list(scores)
+    if provenance_score is not None:
+        probability_inputs.append(provenance_score)
+    consensus = sum(probability_inputs) / len(probability_inputs) if probability_inputs else None
+    ai_votes = sum(score >= 0.5 for score in scores)
+    local["api_results"] = api_results
+    local["api_summary"] = {
+        "checked": len(successful),
+        "failed": len(failed),
+        "configured": len(successful) + len(failed),
+        "score": round(consensus, 4) if consensus is not None else None,
+        "ai_votes": ai_votes,
+    }
+
+    source_names = [str(item.get("name", "детектор")) for item in successful]
+    if provenance_score is not None:
+        source_names.append("метаданные происхождения")
+    if consensus is None:
+        percent = None
+        probability_label = "Недостаточно данных"
+        probability_detail = "Ни одна вероятностная модель не ответила; отсутствие меток не означает 0%."
+    else:
+        # Не показываем абсолютные 0/100: любой детектор допускает ошибки и стареет.
+        percent = max(1, min(99, round(consensus * 100)))
+        spread = max(probability_inputs) - min(probability_inputs) if len(probability_inputs) > 1 else 0
+        if spread >= 0.45:
+            probability_label = "Низкая согласованность"
+        elif len(probability_inputs) == 1:
+            probability_label = "Один модельный сигнал"
+        else:
+            probability_label = "Сводная оценка"
+        probability_detail = "Основание: " + ", ".join(source_names)
+        if spread >= 0.45:
+            probability_detail += ". Детекторы сильно расходятся — процент ненадёжен."
+
+        if local["verdict"] == "detected" or ai_votes > len(scores) / 2 or consensus >= 0.65:
+            local["verdict"] = "detected"
+            local["headline"] = "Есть признаки AI‑происхождения"
+        elif ai_votes == 0 and consensus <= 0.35:
+            local["verdict"] = "clear"
+            local["headline"] = "Скорее не сгенерировано"
+        else:
+            local["verdict"] = "review"
+            local["headline"] = "Детекторы расходятся во мнениях"
+        local["confidence"] = percent
+    local["generation_probability"] = {
+        "percent": percent,
+        "label": probability_label,
+        "detail": probability_detail,
+        "sources": len(probability_inputs),
+    }
+    local["probability_breakdown"] = _probability_breakdown(local, api_results)
+    return local
+
+
+def _percentage(score: float) -> int:
+    return max(0, min(99, round(score * 100)))
+
+
+def _probability_breakdown(local: dict[str, Any], results: list[ProviderResult]) -> list[dict[str, Any]]:
+    successful = [item for item in results if item.get("status") == "ok"]
+    model = next((item for item in successful if item.get("id") == "local_frontier"), None)
+    semantic = next((item for item in successful if item.get("id") == "openai_vision"), None)
+    external = [
+        item for item in successful
+        if item.get("id") not in {"local_frontier", "openai_vision"} and item.get("verdict") != "unknown"
+    ]
+
+    finding_kinds = {str(item.get("kind")) for item in local.get("findings", [])}
+    if "c2pa_generative" in finding_kinds:
+        provenance = 99
+        provenance_detail = "Подписанный C2PA-манифест указывает на генеративный источник."
+    elif finding_kinds & {"provider", "generation_metadata"}:
+        provenance = 95
+        provenance_detail = "В файле найдены сигнатуры генератора или параметры генерации."
+    elif "corner" in finding_kinds:
+        provenance = 40
+        provenance_detail = "Эвристика заметила возможный бейдж в углу; нужна ручная проверка."
+    elif finding_kinds & {"credentials", "c2pa_invalid"}:
+        provenance = 20
+        provenance_detail = "Следы происхождения есть, но они не подтверждают генерацию."
+    else:
+        provenance = 0
+        provenance_detail = "AI-сигнатуры, C2PA-указание и видимый бейдж не найдены."
+
+    forensic_signals = [
+        signal for signal in (local.get("forensics") or {}).get("signals", [])
+        if signal.get("status") != "not_applicable"
+    ]
+    if forensic_signals:
+        signal_scores = {"normal": 0.05, "review": 0.65, "error": 0.35}
+        pixel_score = sum(signal_scores.get(str(signal.get("status")), 0.15) for signal in forensic_signals) / len(forensic_signals)
+        reviewed = sum(signal.get("status") == "review" for signal in forensic_signals)
+        pixel_detail = (
+            f"Подозрительных эвристик: {reviewed} из {len(forensic_signals)}. "
+            "Это индекс аномалий, а не самостоятельное доказательство."
+        )
+        pixel_percent: int | None = _percentage(pixel_score)
+    else:
+        pixel_percent = None
+        pixel_detail = "Формат или размер изображения не позволил рассчитать индекс."
+
+    external_score = sum(float(item["score"]) for item in external) / len(external) if external else None
+    return [
+        {
+            "id": "model",
+            "title": "Локальная ML-модель",
+            "percent": _percentage(float(model["score"])) if model else None,
+            "detail": model.get("detail") if model else "Локальная модель не ответила.",
+            "source_count": 1 if model else 0,
+        },
+        {
+            "id": "semantic",
+            "title": "Смысловой анализ",
+            "percent": _percentage(float(semantic["score"])) if semantic else None,
+            "detail": semantic.get("detail") if semantic else "Нужен OPENAI_API_KEY; без него этот срез не участвует в итоге.",
+            "source_count": 1 if semantic else 0,
+        },
+        {
+            "id": "external",
+            "title": "Внешние детекторы",
+            "percent": _percentage(external_score) if external_score is not None else None,
+            "detail": f"Среднее по {len(external)} подключённым сервисам." if external else "Ни один специализированный внешний API не настроен.",
+            "source_count": len(external),
+        },
+        {
+            "id": "provenance",
+            "title": "Вотермарки и происхождение",
+            "percent": provenance,
+            "detail": provenance_detail,
+            "source_count": 1,
+        },
+        {
+            "id": "pixels",
+            "title": "Пиксельные аномалии",
+            "percent": pixel_percent,
+            "detail": pixel_detail,
+            "source_count": len(forensic_signals),
+        },
+    ]
