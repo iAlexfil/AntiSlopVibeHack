@@ -6,6 +6,7 @@ import os
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -26,11 +27,13 @@ MEMORY_POLL_SECONDS = 0.05
 def _run_worker(data: bytes, environment: dict[str, str]) -> subprocess.CompletedProcess:
     command = [sys.executable, str(WORKER_PATH), str(MODEL_PATH)]
     with subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                          stderr=subprocess.PIPE, env=environment) as process:
+                          stderr=subprocess.PIPE, env=environment) as process, \
+            ThreadPoolExecutor(max_workers=1) as communication_pool:
+        # A single communicate call keeps large stdin transfers alive between RSS checks.
+        communication = communication_pool.submit(process.communicate, input=data)
         try:
             monitored = psutil.Process(process.pid)
             deadline = time.monotonic() + WORKER_TIMEOUT
-            pending = data
             while True:
                 try:
                     if monitored.memory_info().rss > MEMORY_LIMIT_MB * 1024 * 1024:
@@ -41,14 +44,14 @@ def _run_worker(data: bytes, environment: dict[str, str]) -> subprocess.Complete
                 if remaining <= 0:
                     raise subprocess.TimeoutExpired(command, WORKER_TIMEOUT)
                 try:
-                    stdout, stderr = process.communicate(input=pending, timeout=min(MEMORY_POLL_SECONDS, remaining))
+                    stdout, stderr = communication.result(timeout=min(MEMORY_POLL_SECONDS, remaining))
                     return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
-                except subprocess.TimeoutExpired:
-                    pending = None
+                except FutureTimeout:
+                    pass
         finally:
             if process.poll() is None:
                 process.kill()
-            process.communicate()
+            communication.result()
 
 
 @lru_cache(maxsize=1)

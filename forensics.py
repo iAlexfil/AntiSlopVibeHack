@@ -212,6 +212,38 @@ def _walk_validation(value: Any, found: list[dict[str, Any]]) -> None:
             _walk_validation(item, found)
 
 
+def _generative_c2pa_actions(manifest: dict[str, Any]) -> bool:
+    source_types = (
+        "http://cv.iptc.org/newscodes/digitalsourcetype/trainedAlgorithmicMedia",
+        "http://cv.iptc.org/newscodes/digitalsourcetype/compositeWithTrainedAlgorithmicMedia",
+    )
+    assertions = manifest.get("assertions")
+    if not isinstance(assertions, list):
+        return False
+    for assertion in assertions:
+        if not isinstance(assertion, dict) or assertion.get("label") not in {"c2pa.actions", "c2pa.actions.v2"}:
+            continue
+        data = assertion.get("data")
+        if not isinstance(data, dict):
+            continue
+        actions = data.get("actions", [])
+        templates = data.get("templates", []) if assertion["label"] == "c2pa.actions.v2" else []
+        if not isinstance(actions, list) or not isinstance(templates, list):
+            continue
+        for action in actions:
+            if not isinstance(action, dict) or not isinstance(action.get("action"), str):
+                continue
+            source_type = None
+            # C2PA v2 applies wildcard templates, named templates, then the action's own fields.
+            for name in ("*", action["action"]):
+                for template in templates:
+                    if isinstance(template, dict) and template.get("action") == name and "digitalSourceType" in template:
+                        source_type = template["digitalSourceType"]
+            if action.get("digitalSourceType", source_type) in source_types:
+                return True
+    return False
+
+
 def verify_c2pa(raw: bytes, mime_type: str) -> dict[str, Any]:
     try:
         import c2pa
@@ -239,10 +271,7 @@ def verify_c2pa(raw: bytes, mime_type: str) -> dict[str, Any]:
     ]
     untrusted = [item for item in validations if "untrusted" in item["code"].lower()]
     signature_valid = any(code == "claimSignature.validated" for code in codes)
-    raw_manifest = json.dumps(manifest, ensure_ascii=False).lower()
-    generative = any(token in raw_manifest for token in (
-        "trainedalgorithmicmedia", "compositewithtrainedalgorithmicmedia"
-    ))
+    generative = _generative_c2pa_actions(manifest)
     claim_info = manifest.get("claim_generator_info") or []
     generator = claim_info[0].get("name") if claim_info and isinstance(claim_info[0], dict) else manifest.get("claim_generator")
     status = "invalid" if failures else "untrusted" if untrusted else "valid" if signature_valid else "present"

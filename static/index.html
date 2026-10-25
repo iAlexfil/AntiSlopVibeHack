@@ -5,13 +5,13 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="description" content="Проверка изображения на признаки генерации ИИ">
   <title>AntiSlop</title>
-  <link rel="stylesheet" href="/static/app.css?v=6">
+  <link rel="stylesheet" href="/static/app.css?v=11">
 </head>
 <body>
   <header><a href="#">AntiSlop</a></header>
 
   <main>
-    <section class="start">
+    <section id="uploadSection" class="start">
       <h1>Проверка изображения</h1>
       <p>Загрузите файл или вставьте его из буфера.</p>
 
@@ -43,71 +43,83 @@
     </section>
 
     <section id="results" class="results" hidden aria-live="polite">
-      <div class="result-actions"><button id="newCheck" type="button">Другое изображение</button></div>
+      <div class="result-toolbar">
+        <div class="result-file"><span class="eyebrow">Результат проверки</span><h1 id="resultFilename"></h1><p id="resultMeta"></p></div>
+        <div class="result-actions"><button id="repeatCheck" type="button">Проверить ещё раз</button><button id="newCheck" type="button">Другое изображение</button></div>
+      </div>
+
+      <div id="resultImage" class="image-panel result-image">
+        <div class="image-heading"><h2>Изображение</h2><span id="regionHint"></span></div>
+        <div class="image-stage"><div id="visionImageFrame" class="vision-image"><img id="visionPreview" alt="Проверяемое изображение"><div id="visionRegions"></div></div></div>
+        <p id="regionSelection" class="image-caption"></p>
+      </div>
 
       <article id="scoreCard" class="score-card unknown">
-        <img id="resultPreview" alt="Проверенное изображение">
-        <div class="score-content">
-          <strong id="probabilityValue">—</strong>
-          <span>Вероятность генерации ИИ</span>
-          <h2 id="resultHeadline"></h2>
-          <p id="resultSummary" hidden></p>
-          <span id="resultLabel" hidden></span>
+        <div class="score-overview">
+          <div class="score-content"><h2 id="resultHeadline" tabindex="-1"></h2><span id="resultSources" class="result-sources"></span></div>
+          <div class="score-number"><strong id="probabilityValue">—</strong><span>вероятность ИИ</span></div>
         </div>
         <div class="score-line"><span id="probabilityFill"></span></div>
+        <div id="breakdownGrid" class="model-checks" aria-label="Оценки моделей"></div>
       </article>
 
-      <section class="breakdown">
-        <h2>Разбивка</h2>
-        <div id="breakdownGrid"></div>
+      <nav class="analysis-nav" aria-label="Результаты по методам">
+        <a href="#modelAnalysis">Модели и детекторы</a><a href="#provenanceAnalysis">Метки и происхождение</a><a href="#pixelAnalysis">Пиксельный анализ</a><a href="#visualAnalysis">Смысловой анализ</a>
+      </nav>
+
+      <section id="modelAnalysis" class="method-section" aria-labelledby="modelsTitle">
+        <div class="section-heading"><h2 id="modelsTitle">Модели и детекторы</h2></div>
+        <div id="apiResults" class="api-results"></div>
+        <div id="inactiveDetectors" class="inactive-detectors"></div>
       </section>
 
-      <section id="visualAnalysis" class="visual-analysis" hidden>
-        <h2>Что заметила модель</h2>
-        <p id="visionExplanation"></p>
-        <p class="vision-note">Области указаны моделью приблизительно. Наблюдения могут иметь другие объяснения.</p>
-        <div id="visionImageFrame" class="vision-image"><img id="visionPreview" alt="Изображение с отмеченными моделью областями"><div id="visionRegions"></div></div>
-        <div id="visionSignals" class="vision-signals"></div>
-        <ul id="visionLimitations"></ul>
-        <details><summary>JSON результата</summary><pre id="visionJson"></pre></details>
+      <section id="provenanceAnalysis" class="method-section" aria-labelledby="provenanceTitle">
+        <div class="section-heading"><h2 id="provenanceTitle">Метки и происхождение</h2></div>
+        <div id="provenanceChecks" class="provenance-checks"></div>
+        <div class="provenance-evidence">
+          <div><h3>Сигнатуры и метаданные</h3><div id="findings"></div></div>
+          <div><h3>Камера и редактор</h3><div id="exifChecks"></div></div>
+        </div>
+      </section>
+
+      <section id="pixelAnalysis" class="method-section" aria-labelledby="pixelsTitle">
+        <div class="section-heading"><h2 id="pixelsTitle">Пиксельный анализ</h2><span id="pixelSummary"></span></div>
+        <p class="method-note">Не входит в итоговый процент.</p>
+        <div id="forensicSignals" class="forensic-signals"></div>
+      </section>
+
+      <section id="visualAnalysis" class="visual-analysis method-section" hidden aria-labelledby="visualTitle">
+        <div class="section-heading"><h2 id="visualTitle">Смысловой анализ</h2></div>
+          <div class="observations-panel">
+            <div class="section-heading"><h2 id="visionHeading">Наблюдения</h2><span id="signalCount" class="count-badge"></span></div>
+            <p id="visionExplanation"></p>
+            <details id="visionResponseDetails" class="method-details" hidden><summary>Причина</summary><p id="visionResponseText"></p></details>
+            <div id="visionSignals" class="vision-signals"></div>
+            <details id="visionLimitsDetails" class="analysis-limits"><summary>Ограничения анализа</summary><ul id="visionLimitations"></ul></details>
+          </div>
       </section>
 
       <details id="reportDetails" class="report">
-        <summary>Подробный отчёт <span>+</span></summary>
+        <summary>Технический отчёт <span>+</span></summary>
         <div class="report-body">
           <p id="scoreBasis" class="score-basis"></p>
+          <details id="visionJsonSection" class="report-json" hidden><summary>JSON анализа изображения</summary><pre id="visionJson"></pre></details>
 
           <div class="report-grid">
-            <section><h3>Найденные признаки</h3><div id="findings"></div></section>
             <section>
               <h3>Файл</h3>
               <div id="fileFacts" class="file-facts"></div>
               <details class="metadata-details"><summary>Метаданные</summary><div id="metadata" class="metadata"></div></details>
             </section>
+            <section><h3>Ресурсы и идентификаторы</h3><p id="resourceBudget" class="method-note"></p><div id="hashes"></div><h4>Проверка C2PA</h4><div id="c2paResult"></div></section>
           </div>
-
-          <section class="report-section">
-            <div class="report-heading"><h3>Модели и сервисы</h3><span id="apiConsensus"></span></div>
-            <div id="apiResults" class="api-results"></div>
-          </section>
-
-          <section class="report-section">
-            <div class="report-heading"><h3>Пиксельный анализ</h3><span id="resourceBudget"></span></div>
-            <div id="forensicSignals" class="forensic-signals"></div>
-            <div id="forensicMaps" class="forensic-maps"></div>
-            <div class="forensic-details">
-              <div><h4>C2PA</h4><div id="c2paResult"></div></div>
-              <div><h4>EXIF</h4><div id="exifChecks"></div></div>
-              <div><h4>Хеши</h4><div id="hashes"></div></div>
-            </div>
-          </section>
         </div>
       </details>
 
-      <p class="disclaimer">Оценка может ошибаться и не является доказательством происхождения.</p>
+      <p class="disclaimer">Вероятностная оценка, не доказательство.</p>
     </section>
   </main>
 
-  <script src="/static/app.js?v=6"></script>
+  <script src="/static/app.js?v=11"></script>
 </body>
 </html>
