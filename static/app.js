@@ -919,6 +919,7 @@ async function analyze() {
 imagePickButtons.forEach((button) => button.addEventListener('click', (event) => {
   event.preventDefault();
   event.stopPropagation();
+  if (seriesMode && button.id !== 'pickButton') setMode(false);
   if (!isAnalyzing) fileInput.click();
 }));
 dropzone.addEventListener('click', (event) => {
@@ -977,6 +978,11 @@ document.addEventListener('paste', (event) => {
   event.preventDefault();
   const extension = (file.type.split('/')[1] || 'png').replace('jpeg', 'jpg');
   const namedFile = file.name ? file : new File([file], `clipboard-${Date.now()}.${extension}`, { type: file.type || 'image/png' });
+  if (seriesMode) {
+    if (!seriesBusy) addSeriesFiles([namedFile]);
+    $('#seriesDrop').focus();
+    return;
+  }
   chooseFile(namedFile);
   dropzone.focus();
 });
@@ -995,3 +1001,311 @@ fetch('/api/providers')
     setText('#providerStatus', 'Не удалось получить конфигурацию внешних сервисов');
     updateRemoteHint();
   });
+
+// ---------------------------------------------------------------- Серия ---
+
+const MAX_SERIES = 6;
+const seriesDrop = $('#seriesDrop');
+const seriesInput = $('#seriesInput');
+const seriesButton = $('#seriesButton');
+const seriesResults = $('#seriesResults');
+let seriesMode = false;
+let seriesBusy = false;
+let seriesFiles = [];
+
+function setMode(series) {
+  if (isAnalyzing || seriesBusy || seriesMode === series) return;
+  seriesMode = series;
+  $('#singleTab').classList.toggle('active', !series);
+  $('#seriesTab').classList.toggle('active', series);
+  $('#singleTab').setAttribute('aria-selected', String(!series));
+  $('#seriesTab').setAttribute('aria-selected', String(series));
+  $('#singlePanel').hidden = series;
+  $('#seriesPanel').hidden = !series;
+  results.hidden = true;
+  seriesResults.hidden = true;
+  if (series) $('#manualSearch').hidden = true;
+  else updateManualSearchVisibility();
+  setState(series ? (seriesFiles.length >= 2 ? 'ready' : 'idle') : selectedFile ? 'ready' : 'idle');
+}
+
+function seriesUrl(file) {
+  if (!file.previewUrl) file.previewUrl = URL.createObjectURL(file);
+  return file.previewUrl;
+}
+
+function setSeriesError(message) {
+  const error = $('#seriesError');
+  error.textContent = message || '';
+  error.hidden = !message;
+}
+
+function addSeriesFiles(files) {
+  const rejected = [];
+  Array.from(files || []).forEach((file) => {
+    if (!isSupportedFile(file)) rejected.push(`${file.name}: неподдерживаемый формат`);
+    else if (file.size > 20 * 1024 * 1024) rejected.push(`${file.name}: больше 20 МБ`);
+    else if (seriesFiles.length >= MAX_SERIES) rejected.push(`${file.name}: не больше ${MAX_SERIES} снимков`);
+    else seriesFiles.push(file);
+  });
+  setSeriesError(rejected.join('\n'));
+  renderSeriesThumbs();
+}
+
+function removeSeriesFile(index) {
+  if (seriesBusy) return;
+  const [file] = seriesFiles.splice(index, 1);
+  if (file?.previewUrl) URL.revokeObjectURL(file.previewUrl);
+  setSeriesError('');
+  renderSeriesThumbs();
+}
+
+function renderSeriesThumbs() {
+  const root = $('#seriesThumbs');
+  root.replaceChildren();
+  seriesFiles.forEach((file, index) => {
+    const thumb = document.createElement('div');
+    thumb.className = 'series-thumb';
+    thumb.title = `${file.name} · ${formatBytes(file.size)}`;
+    const image = document.createElement('img');
+    image.src = seriesUrl(file);
+    image.alt = file.name;
+    const number = textElement('span', String(index + 1), 'num');
+    const remove = document.createElement('button');
+    remove.type = 'button';
+    remove.className = 'remove-button';
+    remove.setAttribute('aria-label', `Убрать снимок ${index + 1}`);
+    remove.innerHTML = '<svg class="icon" aria-hidden="true"><use href="#icon-close"/></svg>';
+    remove.addEventListener('click', (event) => { event.stopPropagation(); removeSeriesFile(index); });
+    thumb.append(image, number, remove);
+    root.append(thumb);
+  });
+  if (seriesFiles.length && seriesFiles.length < MAX_SERIES) {
+    const add = document.createElement('button');
+    add.type = 'button';
+    add.className = 'series-add';
+    add.textContent = '+ ещё снимок';
+    root.append(add);
+  }
+  root.hidden = !seriesFiles.length;
+  $('#seriesEmpty').hidden = Boolean(seriesFiles.length);
+  seriesButton.disabled = seriesBusy || seriesFiles.length < 2;
+  setButtonLabel(seriesButton, seriesFiles.length === 1 ? 'Нужен ещё один снимок' : 'Проверить серию');
+  if (seriesMode) setState(seriesFiles.length >= 2 ? 'ready' : 'idle');
+}
+
+function setButtonLabel(button, text) {
+  const label = button.querySelector('span');
+  if (label) label.textContent = text;
+  else button.textContent = text;
+}
+
+function textElement(tag, text, className) {
+  const element = document.createElement(tag);
+  if (className) element.className = className;
+  element.textContent = text;
+  return element;
+}
+
+const VERDICT_TEXT = { consistent: 'Согласовано', inconsistent: 'Не согласуется', insufficient: 'Недостаточно данных' };
+const PAIR_TEXT = {
+  consistent_3d: 'согласовано', inconsistent: 'не сходится', planar: 'плоская сцена',
+  near_duplicate: 'почти дубликат', no_overlap: 'нет общих деталей', weak: 'слабое совпадение',
+};
+
+function renderSeries(data) {
+  $('#seriesCard').className = `series-card ${data.verdict}`;
+  setText('#seriesVerdict', VERDICT_TEXT[data.verdict] || data.verdict || '—');
+  setText('#seriesHeadline', data.headline || '');
+  const count = Number(data.count) || 0;
+  const meta = [`${count} ${plural(count, 'снимок', 'снимка', 'снимков')}`, `режим: ${data.mode === 'person' ? 'один человек' : 'одна сцена'}`];
+  if (Number.isFinite(data.latency_ms)) meta.push(`сравнение ${(data.latency_ms / 1000).toFixed(1)} с`);
+  setText('#seriesMeta', meta.join(' · '));
+
+  const actions = $('#seriesActions');
+  actions.replaceChildren(...asArray(data.recommendations).map((text) => textElement('li', text)));
+
+  const reasons = $('#seriesReasons');
+  reasons.replaceChildren();
+  asArray(data.reasons).forEach((item) => {
+    const row = document.createElement('div');
+    row.className = `reason ${item.level} ${item.polarity > 0 ? 'pos' : item.polarity < 0 ? 'neg' : 'neutral'}`;
+    const body = document.createElement('div');
+    body.append(textElement('b', item.title || ''), textElement('p', item.detail || ''));
+    row.append(textElement('span', '', 'reason-dot'), body);
+    reasons.append(row);
+  });
+  if (!reasons.childElementCount) reasons.append(textElement('p', 'Явных сигналов нет.', 'series-meta'));
+
+  const images = $('#seriesImages');
+  images.replaceChildren();
+  asArray(data.images).forEach((item) => {
+    const figure = document.createElement('figure');
+    figure.className = 'series-image';
+    const image = document.createElement('img');
+    if (seriesFiles[item.index]) image.src = seriesUrl(seriesFiles[item.index]);
+    image.alt = item.filename || '';
+    const caption = document.createElement('figcaption');
+    caption.title = item.headline || '';
+    const numeric = Number.isFinite(item.percent);
+    caption.append(textElement('span', `${item.index + 1}. ${item.filename}`), textElement('b', numeric ? `${item.percent}% ИИ` : '—', numeric && item.percent >= 65 ? 'high' : ''));
+    figure.append(image, caption);
+    images.append(figure);
+  });
+
+  const faces = data.faces;
+  $('#seriesFacesBlock').hidden = !faces;
+  if (faces) {
+    const faceRoot = $('#seriesFaces');
+    faceRoot.replaceChildren();
+    asArray(faces.faces).forEach((face, index) => {
+      const figure = document.createElement('figure');
+      if (face && typeof face.crop === 'string' && face.crop.startsWith('data:image/')) {
+        const image = document.createElement('img');
+        image.src = face.crop;
+        image.alt = `Лицо на снимке ${index + 1}`;
+        figure.append(image, textElement('figcaption', `Снимок ${index + 1} · ${face.size_px}px`));
+      } else {
+        figure.append(textElement('figcaption', `Снимок ${index + 1}: лицо не найдено`));
+      }
+      faceRoot.append(figure);
+    });
+    const pairRoot = $('#seriesFacePairs');
+    pairRoot.replaceChildren();
+    asArray(faces.pairs).forEach((pair) => {
+      const row = document.createElement('div');
+      row.className = 'face-pair';
+      const pose = pair.pose_diff_deg !== null && pair.pose_diff_deg !== undefined ? ` · поворот головы ${pair.pose_diff_deg}°` : '';
+      row.append(
+        textElement('b', `Снимки ${pair.a + 1} и ${pair.b + 1}: ${pair.same_person ? 'тот же человек' : 'не совпадает'}`),
+        textElement('span', `сходство ${Number(pair.cosine).toFixed(2)} · идентичность пикселей ${Number(pair.face_ssim).toFixed(2)}${pose}`),
+      );
+      pairRoot.append(row);
+    });
+  }
+
+  const pairs = $('#seriesPairs');
+  pairs.replaceChildren();
+  asArray(data.pairs).forEach((pair) => {
+    const box = document.createElement('article');
+    box.className = 'series-pair';
+    const top = document.createElement('div');
+    top.className = 'series-pair-top';
+    top.append(textElement('b', `Снимки ${pair.a + 1} и ${pair.b + 1}`), textElement('span', PAIR_TEXT[pair.status] || pair.status, `chip ${pair.status}`));
+    box.append(top, textElement('p', pair.detail || ''));
+    if (typeof pair.visual === 'string' && pair.visual.startsWith('data:image/')) {
+      const image = document.createElement('img');
+      image.src = pair.visual;
+      image.alt = `Совпадения между снимками ${pair.a + 1} и ${pair.b + 1}`;
+      image.loading = 'lazy';
+      box.append(image);
+    }
+    const stats = document.createElement('dl');
+    [
+      ['Совпадений', pair.matches],
+      ['Согласованных', pair.inliers],
+      ['Покрытие', Number.isFinite(pair.coverage) ? `${Math.round(pair.coverage * 100)}%` : null],
+      ['Перед камерой', pair.cheirality ? `${Math.round(pair.cheirality.ratio * 100)}%` : null],
+      ['Без пары', Number.isFinite(pair.suspicious_share) ? `${Math.round(pair.suspicious_share * 100)}%` : null],
+    ].forEach(([name, value]) => {
+      if (value === null || value === undefined) return;
+      const group = document.createElement('div');
+      group.append(textElement('dt', `${name}:`), textElement('dd', String(value)));
+      stats.append(group);
+    });
+    box.append(stats);
+    pairs.append(box);
+  });
+
+  const exif = data.exif_series || {};
+  const known = (value) => value !== null && value !== undefined;
+  const facts = [
+    ['EXIF', `${exif.with_exif ?? 0} из ${count}`],
+    ['Устройства', asArray(exif.devices).join(', ') || '—'],
+    ['Разброс времени', known(exif.time_span_s) ? `${Math.round(exif.time_span_s)} с` : '—'],
+    ['Разброс GPS', known(exif.gps_max_distance_m) ? `${exif.gps_max_distance_m} м` : '—'],
+  ];
+  $('#seriesExif').replaceChildren(...facts.map(([key, value]) => {
+    const fact = document.createElement('div');
+    fact.className = 'fact';
+    fact.append(textElement('span', key), textElement('b', value));
+    return fact;
+  }));
+
+  seriesResults.hidden = false;
+  setState('complete');
+  seriesResults.focus({ preventScroll: true });
+  seriesResults.scrollIntoView({ behavior: motionBehavior(), block: 'start' });
+}
+
+async function analyzeSeries() {
+  if (seriesBusy || seriesFiles.length < 2) return;
+  seriesBusy = true;
+  setSeriesError('');
+  seriesButton.disabled = true;
+  seriesButton.classList.add('is-busy');
+  setButtonLabel(seriesButton, 'Анализируем серию…');
+  $('#seriesStatus').hidden = false;
+  seriesDrop.classList.add('scanning');
+  seriesResults.hidden = true;
+  setState('analyzing');
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), 180000);
+  try {
+    const form = new FormData();
+    seriesFiles.forEach((file) => form.append('files', file, file.name));
+    const mode = document.querySelector('input[name="seriesMode"]:checked')?.value || 'scene';
+    const remote = $('#seriesRemote').checked;
+    const response = await fetch(`/api/analyze-set?mode=${mode}&remote=${remote}`, { method: 'POST', body: form, signal: controller.signal });
+    let data = null;
+    try { data = await response.json(); } catch { data = null; }
+    if (!response.ok || !data) throw new Error(data?.detail || 'Не удалось проверить серию. Попробуйте ещё раз.');
+    renderSeries(data);
+  } catch (error) {
+    setSeriesError(error.name === 'AbortError' ? 'Проверка серии заняла слишком много времени. Попробуйте меньше снимков.' : error.message || 'Ошибка проверки серии');
+    setState(seriesFiles.length >= 2 ? 'ready' : 'idle');
+  } finally {
+    window.clearTimeout(timeout);
+    seriesBusy = false;
+    seriesButton.classList.remove('is-busy');
+    seriesButton.disabled = seriesFiles.length < 2;
+    setButtonLabel(seriesButton, 'Проверить ещё раз');
+    $('#seriesStatus').hidden = true;
+    seriesDrop.classList.remove('scanning');
+  }
+}
+
+$('#singleTab').addEventListener('click', () => setMode(false));
+$('#seriesTab').addEventListener('click', () => setMode(true));
+$('#seriesPick').addEventListener('click', (event) => { event.stopPropagation(); if (!seriesBusy) seriesInput.click(); });
+seriesDrop.addEventListener('click', (event) => {
+  if (seriesBusy) return;
+  if (!event.target.closest('button') || event.target.closest('.series-add')) seriesInput.click();
+});
+seriesDrop.addEventListener('keydown', (event) => {
+  if (event.target !== seriesDrop || (event.key !== 'Enter' && event.key !== ' ')) return;
+  event.preventDefault();
+  if (!seriesBusy) seriesInput.click();
+});
+seriesInput.addEventListener('change', () => { addSeriesFiles(seriesInput.files); seriesInput.value = ''; });
+let seriesDragDepth = 0;
+seriesDrop.addEventListener('dragenter', (event) => { event.preventDefault(); if (seriesBusy) return; seriesDragDepth += 1; seriesDrop.classList.add('dragging'); });
+seriesDrop.addEventListener('dragover', (event) => { event.preventDefault(); if (event.dataTransfer) event.dataTransfer.dropEffect = seriesBusy ? 'none' : 'copy'; });
+seriesDrop.addEventListener('dragleave', (event) => { event.preventDefault(); seriesDragDepth = Math.max(0, seriesDragDepth - 1); if (!seriesDragDepth) seriesDrop.classList.remove('dragging'); });
+seriesDrop.addEventListener('drop', (event) => {
+  event.preventDefault();
+  seriesDragDepth = 0;
+  seriesDrop.classList.remove('dragging');
+  if (!seriesBusy) addSeriesFiles(event.dataTransfer?.files);
+});
+seriesButton.addEventListener('click', analyzeSeries);
+$('#seriesNew').addEventListener('click', () => {
+  if (seriesBusy) return;
+  seriesFiles.forEach((file) => file.previewUrl && URL.revokeObjectURL(file.previewUrl));
+  seriesFiles = [];
+  setSeriesError('');
+  renderSeriesThumbs();
+  seriesResults.hidden = true;
+  seriesDrop.focus({ preventScroll: true });
+  $('#checker').scrollIntoView({ block: 'start', behavior: motionBehavior() });
+});

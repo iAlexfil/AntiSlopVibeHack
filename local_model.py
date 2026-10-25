@@ -23,23 +23,27 @@ WORKER_TIMEOUT = 28
 MEMORY_POLL_SECONDS = 0.05
 
 
-def _run_worker(data: bytes, environment: dict[str, str]) -> subprocess.CompletedProcess:
-    command = [sys.executable, str(WORKER_PATH), str(MODEL_PATH)]
+def _run_worker(data: bytes, environment: dict[str, str], command: list[str] | None = None,
+                timeout: float | None = None, memory_limit_mb: int | None = None) -> subprocess.CompletedProcess:
+    # Значения по умолчанию читаются при вызове: тесты и будущие воркеры подменяют модульные константы.
+    command = command or [sys.executable, str(WORKER_PATH), str(MODEL_PATH)]
+    timeout = WORKER_TIMEOUT if timeout is None else timeout
+    memory_limit_mb = MEMORY_LIMIT_MB if memory_limit_mb is None else memory_limit_mb
     with subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                           stderr=subprocess.PIPE, env=environment) as process:
         try:
             monitored = psutil.Process(process.pid)
-            deadline = time.monotonic() + WORKER_TIMEOUT
+            deadline = time.monotonic() + timeout
             pending = data
             while True:
                 try:
-                    if monitored.memory_info().rss > MEMORY_LIMIT_MB * 1024 * 1024:
+                    if monitored.memory_info().rss > memory_limit_mb * 1024 * 1024:
                         raise MemoryError
                 except psutil.NoSuchProcess:
                     pass  # The worker may have exited before the next RSS sample.
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    raise subprocess.TimeoutExpired(command, WORKER_TIMEOUT)
+                    raise subprocess.TimeoutExpired(command, timeout)
                 try:
                     stdout, stderr = process.communicate(input=pending, timeout=min(MEMORY_POLL_SECONDS, remaining))
                     return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
@@ -110,3 +114,35 @@ def run_local_model(data: bytes) -> dict[str, Any]:
         "model_size_mb": status["size_mb"],
         "detail": "Локальная ONNX-модель; скрининговый сигнал, а не доказательство происхождения.",
     }
+
+
+MULTIVIEW_WORKER_PATH = ROOT / "multiview_worker.py"
+MULTIVIEW_TIMEOUT = 50
+
+
+def run_multiview(items: list[tuple[str, bytes]], mode: str) -> dict[str, Any]:
+    """Анализ серии в отдельном процессе: тот же RSS watchdog и таймаут, что у ML-воркера (см. multiview_worker.py)."""
+    from multiview_worker import MEMORY_LIMIT_MB as MULTIVIEW_MEMORY_MB
+
+    header = json.dumps({"mode": mode, "names": [name for name, _ in items], "sizes": [len(data) for _, data in items]}).encode() + b"\n"
+    environment = os.environ.copy()
+    environment.update({"OMP_NUM_THREADS": "1", "OPENBLAS_NUM_THREADS": "1", "MKL_NUM_THREADS": "1", "MALLOC_ARENA_MAX": "2"})
+    try:
+        process = _run_worker(
+            header + b"".join(data for _, data in items), environment,
+            command=[sys.executable, str(MULTIVIEW_WORKER_PATH)],
+            timeout=MULTIVIEW_TIMEOUT, memory_limit_mb=MULTIVIEW_MEMORY_MB,
+        )
+    except subprocess.TimeoutExpired:
+        return {"error": f"Анализ серии превысил таймаут {MULTIVIEW_TIMEOUT} секунд"}
+    except MemoryError:
+        return {"error": f"Анализ серии превысил лимит памяти {MULTIVIEW_MEMORY_MB} МБ"}
+    except (psutil.Error, OSError):
+        return {"error": "Не удалось запустить или контролировать воркер серии"}
+    try:
+        payload = json.loads(process.stdout.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return {"error": process.stderr.decode("utf-8", errors="ignore")[-240:] or "Некорректный ответ воркера серии"}
+    if process.returncode != 0 and "error" not in payload:
+        return {"error": "Воркер серии завершился с ошибкой"}
+    return payload

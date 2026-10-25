@@ -8,8 +8,8 @@
   <title>AntiSlop — фото или нейросеть?</title>
   <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
   <link rel="preload" href="/static/fonts/unbounded-cyrillic.woff2" as="font" type="font/woff2" crossorigin>
-  <link rel="stylesheet" href="/static/app.css?v=10">
-  <script src="/static/effects.js?v=10" defer></script>
+  <link rel="stylesheet" href="/static/app.css?v=11">
+  <script src="/static/effects.js?v=11" defer></script>
 </head>
 <body data-state="idle">
   <svg class="icon-definitions" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
@@ -44,8 +44,8 @@
     <section id="checker" class="checker-section page-width" aria-labelledby="checkerTitle">
       <div class="section-heading"><h2 id="checkerTitle">Проверьте изображение<span>.</span></h2><p>Выберите файл или вставьте его из буфера.</p></div>
       <div class="checker">
-        <div class="checker-heading"><span class="eyebrow">Изображение</span><span id="analysisState" class="state-badge"><span class="status-dot"></span> Ожидает изображение</span></div>
-        <div class="checker-layout">
+        <div class="checker-heading"><div class="mode-switch" role="tablist" aria-label="Режим проверки"><button id="singleTab" class="active" type="button" role="tab" aria-selected="true">Одно фото</button><button id="seriesTab" type="button" role="tab" aria-selected="false">Серия фото</button></div><span id="analysisState" class="state-badge"><span class="status-dot"></span> Ожидает изображение</span></div>
+        <div id="singlePanel" class="checker-layout">
           <div class="upload-column">
             <div id="dropzone" class="dropzone" tabindex="0" role="button" aria-label="Выбрать изображение для проверки" aria-describedby="uploadHint">
               <input id="fileInput" type="file" accept="image/png,image/jpeg,image/webp,image/gif,image/tiff,image/bmp,.tif,.tiff" hidden>
@@ -63,6 +63,29 @@
             <div id="uploadError" class="upload-error" role="alert" hidden></div>
             <div id="analyzeStatus" class="analyze-status" role="status" hidden><span class="progress-spinner" aria-hidden="true"></span><span id="analysisStage">Изучаем изображение…</span></div>
             <div id="providerStatus" hidden></div>
+          </div>
+        </div>
+        <div id="seriesPanel" class="checker-layout" hidden>
+          <div class="upload-column">
+            <div id="seriesDrop" class="dropzone series-drop" tabindex="0" role="button" aria-label="Добавить снимки серии" aria-describedby="seriesHint">
+              <input id="seriesInput" type="file" accept="image/png,image/jpeg,image/webp,image/gif,image/tiff,image/bmp,.tif,.tiff" multiple hidden>
+              <span class="frame-corner top-left" aria-hidden="true"></span><span class="frame-corner top-right" aria-hidden="true"></span><span class="frame-corner bottom-left" aria-hidden="true"></span><span class="frame-corner bottom-right" aria-hidden="true"></span>
+              <div id="seriesEmpty" class="drop-empty"><div class="upload-icon" aria-hidden="true"><svg class="icon"><use href="#icon-image"/></svg><span>+</span></div><h3>Перетащите 2–6 снимков</h3><p>одной сцены с разных ракурсов или одного человека</p><button id="seriesPick" class="pick-button" type="button">Выбрать файлы <svg class="icon" aria-hidden="true"><use href="#icon-plus"/></svg></button><small><kbd>Ctrl</kbd> + <kbd>V</kbd><span> / ⌘ V</span> добавляет снимок</small></div>
+              <div id="seriesThumbs" class="series-thumbs" hidden></div>
+            </div>
+            <p id="seriesHint" class="upload-hint">Снимки сравниваются между собой: геометрия ракурсов, метаданные, лица</p>
+          </div>
+          <div class="checker-controls">
+            <div class="check-symbol" aria-hidden="true"><svg class="icon"><use href="#icon-scan"/></svg></div>
+            <h3>Что проверяем</h3>
+            <div class="series-kind" role="radiogroup" aria-label="Что проверяем">
+              <label><input type="radio" name="seriesMode" value="scene" checked><span><b>Одна сцена</b><small>один объект или место с разных ракурсов</small></span></label>
+              <label><input type="radio" name="seriesMode" value="person"><span><b>Один человек</b><small>тот же человек в разных сценах</small></span></label>
+            </div>
+            <div class="remote-option"><div class="remote-copy"><label for="seriesRemote">Дополнительные сервисы</label><p>Каждый снимок также получат подключённые сервисы.</p></div><label class="remote-toggle"><input id="seriesRemote" type="checkbox"><span class="switch-track" aria-hidden="true"></span><span class="sr-only">Использовать внешние сервисы для серии</span></label></div>
+            <button id="seriesButton" class="primary-button" type="button" disabled><span>Проверить серию</span><svg class="icon" aria-hidden="true"><use href="#icon-arrow"/></svg></button>
+            <div id="seriesError" class="upload-error" role="alert" hidden></div>
+            <div id="seriesStatus" class="analyze-status" role="status" hidden><span class="progress-spinner" aria-hidden="true"></span><span>Сравниваем снимки…</span></div>
           </div>
         </div>
       </div>
@@ -95,6 +118,26 @@
       </details>
     </section>
 
+    <section id="seriesResults" class="results page-width" hidden aria-label="Результат проверки серии" aria-live="polite" tabindex="-1">
+      <div class="results-heading"><div><p class="eyebrow">Проверка серии</p><h2>Результат проверки</h2></div><button id="seriesNew" class="text-button" type="button">Другая серия<svg class="icon" aria-hidden="true"><use href="#icon-arrow"/></svg></button></div>
+      <article id="seriesCard" class="series-card insufficient"><strong id="seriesVerdict">—</strong><h3 id="seriesHeadline"></h3><p id="seriesMeta" class="series-meta"></p></article>
+      <div class="series-columns">
+        <section class="series-block"><h3>Что делать</h3><ul id="seriesActions" class="series-actions"></ul></section>
+        <section class="series-block"><h3>Почему</h3><div id="seriesReasons"></div></section>
+      </div>
+      <section class="series-block"><h3>Снимки</h3><div id="seriesImages" class="series-images"></div></section>
+      <section id="seriesFacesBlock" class="series-block" hidden><h3>Лица</h3><div id="seriesFaces" class="series-faces"></div><div id="seriesFacePairs"></div></section>
+      <details class="report">
+        <summary><span class="report-summary-copy"><svg class="icon" aria-hidden="true"><use href="#icon-scan"/></svg><span>Геометрия пар<small>Совпадения точек, несогласованные зоны и метаданные серии</small></span></span><span class="report-plus" aria-hidden="true">+</span></summary>
+        <div class="report-body">
+          <p class="score-basis">Зелёные линии — точки, согласованные с перспективой; красные — не согласованные. Красные клетки — детализированные участки без пары.</p>
+          <div id="seriesPairs" class="series-pairs"></div>
+          <div id="seriesExif" class="file-facts"></div>
+        </div>
+      </details>
+      <p class="series-disclaimer">Согласованность серии повышает доверие, но не доказывает подлинность: AI-видео и редакторы тоже умеют выдавать согласованные кадры.</p>
+    </section>
+
     <section id="manualSearch" class="image-search-panel page-width" hidden aria-label="Поиск по выбранной картинке" tabindex="-1">
       <div class="search-panel-inner"><h2>Поиск по картинке</h2><div class="search-providers"><button type="button" data-image-search="yandex" aria-label="Искать выбранное изображение в Яндексе в новой вкладке">Яндекс <span aria-hidden="true">↗</span></button><button type="button" data-image-search="google" aria-label="Искать выбранное изображение в Google в новой вкладке">Google <span aria-hidden="true">↗</span></button></div><p class="image-search-info">Для поиска изображение загружается в Яндекс.</p><p id="imageSearchStatus" class="image-search-status" role="status" hidden></p></div>
     </section>
@@ -105,10 +148,11 @@
         <article><span class="method-number" aria-hidden="true">01</span><svg class="icon" aria-hidden="true"><use href="#icon-image"/></svg><h3>Визуальный анализ</h3><p>Модели ищут следы генерации в деталях, текстурах и содержимом изображения.</p></article>
         <article><span class="method-number" aria-hidden="true">02</span><svg class="icon" aria-hidden="true"><use href="#icon-shield"/></svg><h3>Происхождение</h3><p>Проверяются метаданные, цифровые подписи C2PA и доступные водяные знаки.</p></article>
         <article><span class="method-number" aria-hidden="true">03</span><svg class="icon" aria-hidden="true"><use href="#icon-scan"/></svg><h3>Пиксельный анализ</h3><p>Шум, сжатие, частотный спектр и повторяющиеся структуры дополняют картину.</p></article>
+        <article><span class="method-number" aria-hidden="true">04</span><svg class="icon" aria-hidden="true"><use href="#icon-check"/></svg><h3>Серия снимков</h3><p>Несколько ракурсов одной сцены сверяются по законам перспективы — подделать согласованную серию намного труднее.</p></article>
       </div>
     </section>
   </main>
   <footer class="site-footer page-width"><a class="footer-brand" href="/">ANTISLOP</a><a href="#checker">Проверить изображение <span aria-hidden="true">↗</span></a><span>© 2026</span></footer>
-  <script src="/static/app.js?v=10"></script>
+  <script src="/static/app.js?v=11"></script>
 </body>
 </html>
