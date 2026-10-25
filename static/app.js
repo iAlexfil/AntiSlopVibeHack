@@ -107,10 +107,11 @@ function renderBreakdown(data) {
 function renderFileReport(data) {
   const findings = $('#findings');
   findings.innerHTML = '';
-  if (!data.findings.length) {
+  const findingItems = data.findings || [];
+  if (!findingItems.length) {
     findings.innerHTML = '<p class="empty-copy">AI-специфичные метаданные, C2PA-указание и видимый бейдж не найдены. Модельные результаты показаны отдельно ниже.</p>';
   } else {
-    data.findings.forEach((item) => {
+    findingItems.forEach((item) => {
       const row = document.createElement('div');
       row.className = `finding ${item.level}`;
       row.innerHTML = '<span class="finding-dot"></span><div><b></b><p></p></div>';
@@ -134,8 +135,9 @@ function renderFileReport(data) {
 
   const metadata = $('#metadata');
   metadata.innerHTML = '';
-  if (!data.metadata.length) metadata.textContent = 'Метаданные отсутствуют или были очищены.';
-  data.metadata.forEach((item) => {
+  const metadataItems = data.metadata || [];
+  if (!metadataItems.length) metadata.textContent = 'Метаданные отсутствуют или были очищены.';
+  metadataItems.forEach((item) => {
     const row = document.createElement('div');
     row.textContent = `${item.key}: ${item.value}`;
     metadata.append(row);
@@ -190,7 +192,7 @@ function renderForensics(data) {
 
   const signals = $('#forensicSignals');
   signals.innerHTML = '';
-  report.signals.forEach((signal) => {
+  (report.signals || []).forEach((signal) => {
     const card = document.createElement('article');
     card.className = `forensic-signal ${signal.status}`;
     card.innerHTML = '<div class="forensic-signal-top"><b></b><span class="lamp"></span></div><div class="forensic-value"></div><small></small><p></p>';
@@ -203,7 +205,7 @@ function renderForensics(data) {
 
   const maps = $('#forensicMaps');
   maps.innerHTML = '';
-  report.maps.forEach((map) => {
+  (report.maps || []).forEach((map) => {
     const card = document.createElement('figure');
     card.className = 'forensic-map';
     const image = document.createElement('img');
@@ -227,10 +229,10 @@ function renderForensics(data) {
 
   const exif = $('#exifChecks');
   exif.innerHTML = '';
-  report.exif_checks.forEach((check) => appendDetail(exif, check.name, check.detail));
+  (report.exif_checks || []).forEach((check) => appendDetail(exif, check.name, check.detail));
   const hashes = $('#hashes');
   hashes.innerHTML = '';
-  Object.entries(report.hashes).forEach(([name, value]) => appendDetail(hashes, name, value));
+  Object.entries(report.hashes || {}).forEach(([name, value]) => appendDetail(hashes, name, value));
 }
 
 function renderResult(data) {
