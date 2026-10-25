@@ -6,3 +6,5 @@ httpx>=0.28,<1
 python-dotenv>=1.0,<2
 c2pa-python>=0.38,<1
 onnxruntime>=1.23,<2
+opencv-python-headless>=4.10,<5
+python-multipart>=0.0.9,<1

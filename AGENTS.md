@@ -64,6 +64,13 @@ AntiSlop — MVP веб-сервиса, который оценивает вер
 | `test_main.py` | metadata/signature smoke tests |
 | `test_forensics.py` | forensic smoke tests |
 | `test_services.py` | адаптеры API, OpenAI structured output и aggregation tests |
+| `evaluation/` | модуль оценки качества: выгрузка OpenFake, свои папки, прогон через `main.run_pipeline`, метрики и отчёт |
+| `test_evaluation.py` | метрики, folder manifest, отчёт и laundering-варианты |
+| `multiview.py` | анализ серии: SIFT + MAGSAC (F/H), cheirality, карта несогласованных зон, EXIF серии, лица YuNet/SFace, правила вердикта |
+| `multiview_worker.py` | изолированный процесс анализа серии с лимитами, проверка SHA-256 лицевых моделей |
+| `series.py` | сборка ответа серии без OpenCV: сводка снимков, лицо против фона, рекомендации действий |
+| `models/face_detection_yunet_2023mar.onnx`, `models/face_recognition_sface_2021dec.onnx` | лицевые модели OpenCV Zoo (MIT и Apache 2.0) |
+| `test_multiview.py` | синтетические 3D/«поплывшие»/плоские/дубликаты, EXIF серии, правила лиц, finalize |
 
 Файлы `static/styles.css`, `static/api.css`, `static/forensics.css` и `static/probability.css` остались от предыдущей версии интерфейса и сейчас не подключены в `index.html`. Не изменяйте их, считая актуальными стилями. Их можно удалить отдельным осознанным cleanup-коммитом после проверки отсутствия ссылок.
 
@@ -179,6 +186,24 @@ Smoke sample `/tmp/antislope-C.jpg`, использовавшийся во вр�
 
 Ручные/metadata-маркеры в `main.py` покрывают Midjourney, OpenAI/DALL·E/GPT Image, Stable Diffusion/ComfyUI/A1111, Firefly, Imagen/Gemini, Ideogram, Leonardo, Runway, NovelAI, Flux, Canva, Microsoft Designer, NightCafe и Playground AI.
 
+### Анализ серии (`POST /api/analyze-set`)
+
+`multipart files[]` (2–6 снимков, ≤ 20 МБ каждый), `mode=scene|person`, `remote` — как у одиночного анализа. Каждый снимок проходит обычный `run_pipeline`, затем `multiview_worker.py`.
+
+Сцена (все пары снимков, анализ на ≤ 1024 px):
+
+- SIFT 4000 точек, взаимный ratio-test 0.75, затем `findFundamentalMat` и `findHomography` через `USAC_MAGSAC`;
+- статусы пары: `consistent_3d`, `inconsistent`, `planar` (H объясняет ≥ 85% — возможна съёмка экрана/распечатки), `near_duplicate`, `no_overlap` (< 15 согласованных точек — шум), `weak`;
+- cheirality: essential matrix + `recoverPose` с фокусным из `FocalLengthIn35mmFilm` или допущением 28 мм; < 75% точек перед камерами → `inconsistent`;
+- карта несогласованных зон: сетка 16×16, текстурные ячейки внутри оболочки inliers без единого inlier;
+- вердикт `consistent`, только если граф согласованных пар связывает все снимки.
+
+Человек: YuNet → самый крупный face, `alignCrop` 112×112, SFace cosine (порог 0.363 из документации OpenCV, < 0.25 — разные люди). «Вклеенное лицо»: SSIM центральной части после ECC-довыравнивания ≥ 0.85, разница позы (SQPnP по 5 точкам) ≤ 4° и фоны без общих деталей (SIFT по маске без лица). Лицо против фона: локальная модель отдельно на кропе лица и на самой большой полосе кадра без лица; расхождение ≥ 0.6 — слабый сигнал (модель обучена на целых кадрах; размытие лица давало ложный AI, поэтому не используется).
+
+EXIF серии: одна камера, интервал ≤ 30 мин, GPS ≤ 200 м, последовательные номера файлов — слабые положительные; разные устройства — слабый отрицательный; отсутствие EXIF нейтрально.
+
+`series.finalize`: если итог ≥ 65% у большинства снимков, вердикт `consistent` понижается до `insufficient` — согласованность не отменяет AI-сигнал (AI-видео даёт согласованные кадры). Все пороги стартовые, не калиброваны: нужен evaluation-набор серий.
+
 ## 8. Внешние сервисы и секреты
 
 Поддержанные адаптеры:
@@ -226,7 +251,8 @@ Smoke sample `/tmp/antislope-C.jpg`, использовавшийся во вр�
 - ONNX intra/inter-op threads: `1`;
 - CPU memory arena отключена;
 - `OMP`, `OpenBLAS` и `MKL` ограничены одним потоком;
-- `LOCAL_MODEL_GATE = asyncio.Semaphore(1)`: одновременно разрешён только один ML worker.
+- `LOCAL_MODEL_GATE = asyncio.Semaphore(1)`: одновременно разрешён только один ML worker; multiview worker делит тот же семафор.
+- Серия: 2–6 снимков ≤ 20 МБ; multiview worker `RLIMIT_AS` 768 MiB, `RLIMIT_CPU` 40 + 2 с, parent timeout 50 с, `cv2.setNumThreads(1)`, JPEG декодируется через `draft` (≤ 2048 px), анализ на ≤ 1024 px. Замер: 6 снимков с двумя по 40 MP — peak RSS 306 MiB, ~11 с.
 
 Не загружайте модель постоянно в FastAPI-процесс без измерений. Не запускайте несколько тяжёлых моделей параллельно. Если добавляется ensemble, выполняйте модели последовательно в одном контролируемом worker или докажите бенчмарком, что новый peak RSS безопасен.
 
@@ -247,6 +273,8 @@ Smoke sample `/tmp/antislope-C.jpg`, использовавшийся во вр�
 .venv/bin/python test_main.py
 .venv/bin/python test_forensics.py
 .venv/bin/python test_services.py
+.venv/bin/python test_evaluation.py
+.venv/bin/python test_multiview.py
 node --check static/app.js
 .venv/bin/python -m compileall -q main.py services.py local_model.py ml_worker.py
 curl -fsS http://127.0.0.1:8000/health
@@ -264,6 +292,22 @@ curl -fsS http://127.0.0.1:8000/health
 - длинные названия файлов и длинные API error messages;
 - итог `Недостаточно данных`, если модель и API недоступны.
 
+### Оценка качества (`evaluation/`)
+
+```bash
+.venv/bin/pip install -r requirements-eval.txt     # pyarrow, только для выгрузки
+.venv/bin/python -m evaluation fetch --row-groups 3   # ~444 оригинала из OpenFake test, ~300 МБ, лимит --budget-mb 450
+.venv/bin/python -m evaluation run                    # original + jpeg75 + social1080, отчёт в eval_reports/<время>/report.md
+.venv/bin/python -m evaluation run --folder my_set    # свой набор: my_set/real/**, my_set/ai/<генератор>/**
+```
+
+- Источник: `ComplexDataLab/OpenFake`, config `core`, split `test`, лицензия CC BY-NC 4.0 — только для внутренней оценки, не коммитить и не распространять.
+- Картинки берутся из parquet через HTTP Range с проверкой `image_sha256`; JPEG из datasets-server не используются, потому что они пережаты.
+- Утечка: модель обучалась на OpenFake real (LAION/Pexels), ImageNet и генераторах OpenFake. Решения принимайте по срезам «без реальных фото из обучения» (DOCCI) и «генераторы новее модели», а не по общему числу.
+- Предсказания кэшируются в `eval_reports/predictions-<pipeline_version>.jsonl`; версия — хеш файлов пайплайна и модели.
+- `--remote` отправляет изображения во внешние API и тратит квоты; по умолчанию выключен.
+- `eval_data/` и `eval_reports/` в `.gitignore`.
+
 Для model changes нужен хотя бы небольшой фиксированный набор:
 
 - реальные фотографии из проверяемого источника;
@@ -279,9 +323,11 @@ curl -fsS http://127.0.0.1:8000/health
 ## 11. Известные технические долги
 
 - Итоговый ансамбль использует простое среднее и не откалиброван на собственном validation set.
-- Нет сохранённого evaluation dataset и автоматического отчёта по ROC/PR, FPR и recall.
+- Evaluation есть (`python -m evaluation`), но единственный публичный источник — OpenFake, на котором модель частично обучалась; нужен независимый набор реальных фото и свежих генераторов.
 - Нет OCR-анализа и отдельной оценки искажённого текста.
-- Нет локализации подозрительных областей; модель классифицирует всё изображение.
+- Нет локализации подозрительных областей; модель классифицирует всё изображение (для серий есть только карта несогласованных зон).
+- Пороги анализа серии не откалиброваны: нет evaluation-набора серий (реальные multi-view, AI-«другие ракурсы», face swap, PhotoMaker/InstantID). Проверено только на синтетике и примерах OpenCV.
+- Анализ серии: нет OCR кода челленджа, нет родинок/шрамов (MediaPipe), сравнение по смыслу (VLM) не подключено.
 - Нет rate limiting и очереди для внешних API.
 - Нет кэша по SHA-256, поэтому одинаковые файлы анализируются повторно.
 - Diagnostic maps возвращаются как base64 в JSON, что увеличивает ответ.
@@ -295,8 +341,8 @@ curl -fsS http://127.0.0.1:8000/health
 
 ### P0 — качество измерений
 
-1. Собрать версионируемый evaluation manifest с лицензированными/разрешёнными URL или локальными fixture IDs.
-2. Добавить evaluation script с confusion matrix, ROC-AUC, PR-AUC, FPR при выбранном recall и разрезами по генераторам/лаундерингу.
+1. ~~Evaluation script с ROC-AUC, PR-AUC, FPR при recall и срезами по генераторам/лаундерингу~~ — сделано в `evaluation/`.
+2. Добавить независимый от обучения модели набор (`--folder`): собственные реальные фото и свежие генераторы.
 3. Калибровать общий ансамбль на отложенной выборке, а не вручную.
 4. Показать пользователю уровень согласованности и число реально ответивших источников ещё яснее.
 
@@ -374,6 +420,26 @@ curl -fsS http://127.0.0.1:8000/health
 - какие ограничения или вопросы остались.
 
 ## 15. Журнал существенных решений
+
+### 2026-10-25 — анализ серии снимков (сцена и человек)
+
+- Добавлены `POST /api/analyze-set`, `multiview.py`, `multiview_worker.py`, `series.py`, режим «Серия фото» в интерфейсе и `test_multiview.py`; общий `run_pipeline` используется для каждого снимка.
+- Новые зависимости: `opencv-python-headless` (Apache 2.0), `python-multipart`; модели YuNet (MIT, 0.2 МБ) и SFace (Apache 2.0, 37 МБ) с проверкой SHA-256.
+- Почему: одиночный детектор ошибается уверенно (16% FPR на DOCCI); несколько согласованных ракурсов подделать намного дороже, и проверка работает без внешних API.
+- Проверено: стереопара Middlebury aloe → `consistent` (94% inliers, 99.8% cheirality); нелинейно «поплывшая» вариация → `inconsistent` (cheirality 6%); граффити/коробка → `planar`; вклеенное лицо Lena на двух фонах → `inconsistent`; синтетический параллакс и физически невозможный сдвиг слоёв в тестах; desktop/mobile browser flow без JS-ошибок.
+- Найдено и исправлено по ходу: совпадения на одинаковом лице выдавали пару за дубликат (фон теперь сравнивается без лица); 10 «согласованных» точек на несвязанных текстурах — шум (порог 15); размытие лица давало 81% AI фону (заменено чистой полосой фона).
+- Ограничения: пороги не калиброваны; real multi-view с телефонов ещё не прогоняли; AI-видео может пройти геометрию — поэтому AI-оценки снимков показываются отдельно и понижают вердикт.
+
+### 2026-10-25 — модуль оценки `evaluation/` и первый мини-прогон
+
+- Добавлен `python -m evaluation` (fetch/run), общий `main.run_pipeline` для сайта и оценки, `test_evaluation.py`, `requirements-eval.txt`.
+- Данные: 444 оригинала из OpenFake test (3 row group, 301 МБ). Мини-прогон: стратифицированные 130 изображений (65 AI из 17 генераторов / 33 ImageNet + 32 DOCCI), `remote=false`.
+- Результаты `original`: итог ROC-AUC 0.957 [0.914–0.989], recall@0.65 93.8%, FPR@0.65 7.7%; локальная модель одна — ROC-AUC 0.975. `social1080`: итог ROC-AUC 0.957, recall 90.8%, FPR 6.2%.
+- Честный срез без ImageNet (реальные только DOCCI, не из обучения): ROC-AUC 0.939, FPR@0.65 15.6% (5 из 32 реальных фото помечены AI).
+- Слабые группы (n ≤ 6, шумно): recraft-v3 1/3, gpt-image-1.5 3–4/5, midjourney-7 3–4/5; после `social1080` MJ7 и gpt-image-1.5 падают до 60%.
+- Пиксельные эвристики ROC-AUC ≈ 0.5 — правильно, что они не входят в итог. Provenance ловит 28% AI в оригиналах при 0 FP, но после пережатия — 0%.
+- Наблюдение: итог (среднее модели и provenance 0.95) по AUC немного хуже модели одной. Формулу не меняли — выборка мала; проверить на полном наборе.
+- 1 файл отклонён лимитом 20 МБ. Генераторов новее модели (после 2026-08) в выборке нет, срез пуст.
 
 ### 2026-10-25 — scan line без хардкода, читаемый отчёт, cache busting
 

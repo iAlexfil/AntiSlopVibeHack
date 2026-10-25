@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="description" content="Проверка изображения на признаки генерации ИИ">
   <title>AntiSlop</title>
-  <link rel="stylesheet" href="/static/app.css?v=3">
+  <link rel="stylesheet" href="/static/app.css?v=4">
 </head>
 <body>
   <header><a href="#">AntiSlop</a></header>
@@ -13,8 +13,14 @@
   <main>
     <section class="start">
       <h1>Проверка изображения</h1>
-      <p>Загрузите файл или вставьте его из буфера.</p>
+      <p id="startHint">Загрузите файл или вставьте его из буфера.</p>
 
+      <div class="mode-switch" role="tablist" aria-label="Режим проверки">
+        <button id="singleTab" class="active" type="button" role="tab" aria-selected="true">Одно фото</button>
+        <button id="seriesTab" type="button" role="tab" aria-selected="false">Серия фото</button>
+      </div>
+
+      <div id="singlePanel">
       <div id="dropzone" class="dropzone" tabindex="0" role="button" aria-label="Выбрать изображение">
         <input id="fileInput" type="file" accept="image/png,image/jpeg,image/webp,image/gif,image/tiff,image/bmp" hidden>
         <div id="emptyState" class="drop-empty">
@@ -39,7 +45,74 @@
         </label>
         <button id="analyzeButton" class="primary-button" type="button" disabled><span>Проверить</span></button>
       </div>
+      </div>
+
+      <div id="seriesPanel" hidden>
+        <div id="seriesDrop" class="dropzone series-drop" tabindex="0" role="button" aria-label="Добавить снимки серии">
+          <input id="seriesInput" type="file" accept="image/png,image/jpeg,image/webp,image/gif,image/tiff,image/bmp" multiple hidden>
+          <div id="seriesEmpty" class="drop-empty">
+            <span>+</span>
+            <b>2–6 снимков одной сцены или одного человека</b>
+            <small>Перетащите, выберите или вставьте Ctrl/⌘ + V · до 20 МБ каждый</small>
+            <button id="seriesPick" type="button">Выбрать файлы</button>
+          </div>
+          <div id="seriesThumbs" class="series-thumbs" hidden></div>
+        </div>
+        <div class="series-kind" role="radiogroup" aria-label="Что проверяем">
+          <label><input type="radio" name="seriesMode" value="scene" checked><span><b>Одна сцена</b><small>один объект или место с разных ракурсов</small></span></label>
+          <label><input type="radio" name="seriesMode" value="person"><span><b>Один человек</b><small>тот же человек в разных сценах</small></span></label>
+        </div>
+        <div class="actions">
+          <label class="remote-toggle">
+            <input id="seriesRemote" type="checkbox">
+            <span></span>
+            <b>Подключённые API</b>
+          </label>
+          <button id="seriesButton" class="primary-button" type="button" disabled><span>Проверить серию</span></button>
+        </div>
+      </div>
       <div id="providerStatus" hidden></div>
+    </section>
+
+    <section id="seriesResults" class="results" hidden aria-live="polite">
+      <div class="result-actions"><button id="seriesNew" type="button">Другая серия</button></div>
+      <article id="seriesCard" class="series-card">
+        <strong id="seriesVerdict">—</strong>
+        <h2 id="seriesHeadline"></h2>
+        <p class="series-meta" id="seriesMeta"></p>
+      </article>
+
+      <section class="series-block">
+        <h2>Что делать</h2>
+        <ul id="seriesActions" class="series-actions"></ul>
+      </section>
+
+      <section class="series-block">
+        <h2>Почему</h2>
+        <div id="seriesReasons"></div>
+      </section>
+
+      <section class="series-block">
+        <h2>Снимки</h2>
+        <div id="seriesImages" class="series-images"></div>
+      </section>
+
+      <section id="seriesFacesBlock" class="series-block" hidden>
+        <h2>Лица</h2>
+        <div id="seriesFaces" class="series-faces"></div>
+        <div id="seriesFacePairs"></div>
+      </section>
+
+      <details class="report">
+        <summary>Геометрия пар <span>+</span></summary>
+        <div class="report-body">
+          <p class="score-basis">Зелёные линии — точки, согласованные с перспективой; красные — не согласованные. Красные клетки — детализированные участки без пары.</p>
+          <div id="seriesPairs" class="series-pairs"></div>
+          <div id="seriesExif" class="file-facts"></div>
+        </div>
+      </details>
+
+      <p class="disclaimer">Согласованность серии повышает доверие, но не доказывает подлинность: AI-видео и редакторы тоже умеют выдавать согласованные кадры.</p>
     </section>
 
     <section id="results" class="results" hidden aria-live="polite">
@@ -98,6 +171,6 @@
     </section>
   </main>
 
-  <script src="/static/app.js?v=3"></script>
+  <script src="/static/app.js?v=4"></script>
 </body>
 </html>

@@ -150,3 +150,77 @@ main { width: min(720px, calc(100% - 32px)); margin: 0 auto; }
 }
 
 @media (prefers-reduced-motion: reduce) { *:not(.scan-line) { scroll-behavior: auto !important; animation: none !important; transition: none !important; } .scanning .scan-line { animation-duration: 3s; } }
+
+.mode-switch { margin: -10px 0 18px; display: inline-flex; padding: 3px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); }
+.mode-switch button { padding: 8px 14px; border: 0; border-radius: 6px; background: none; color: var(--muted); font-size: 12px; font-weight: 600; cursor: pointer; }
+.mode-switch button.active { color: #fff; background: var(--text); }
+
+.series-drop { min-height: 230px; place-items: stretch; }
+.series-drop .drop-empty { justify-content: center; padding: 30px 16px; }
+.series-thumbs { padding: 12px; display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px; align-content: start; }
+.series-thumb { position: relative; aspect-ratio: 4 / 3; overflow: hidden; border-radius: 8px; background: #111; }
+.series-thumb img { width: 100%; height: 100%; object-fit: cover; }
+.series-thumb .num { position: absolute; left: 6px; top: 6px; min-width: 20px; padding: 2px 6px; border-radius: 4px; color: #fff; background: rgba(0,0,0,.7); font-size: 10px; font-weight: 700; text-align: center; }
+.series-thumb .remove-button { top: 6px; right: 6px; width: 26px; height: 26px; font-size: 17px; }
+.series-add { aspect-ratio: 4 / 3; display: grid; place-items: center; border: 1px dashed #aaa; border-radius: 8px; color: var(--muted); background: none; font-size: 12px; cursor: pointer; }
+.series-kind { margin-top: 12px; display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.series-kind label { cursor: pointer; }
+.series-kind input { position: absolute; opacity: 0; pointer-events: none; }
+.series-kind span { height: 100%; padding: 12px 14px; display: block; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); }
+.series-kind b { display: block; font-size: 13px; }
+.series-kind small { color: var(--muted); font-size: 11px; }
+.series-kind input:checked + span { border-color: var(--text); box-shadow: inset 0 0 0 1px var(--text); }
+.series-kind input:focus-visible + span { outline: 2px solid var(--accent); }
+
+.series-card { padding: 26px 0 30px; border-bottom: 1px solid var(--line); }
+.series-card strong { display: block; font-size: clamp(40px, 9vw, 68px); line-height: .95; letter-spacing: -.05em; }
+.series-card.consistent strong { color: var(--good); }
+.series-card.inconsistent strong { color: var(--accent); }
+.series-card.insufficient strong { color: var(--muted); }
+.series-card h2 { margin: 12px 0 0; font-size: 16px; font-weight: 600; }
+.series-meta { margin: 6px 0 0; color: var(--muted); font-size: 11px; }
+.series-block { padding: 30px 0 4px; }
+.series-block > h2 { margin: 0 0 12px; font-size: 18px; }
+.series-actions { margin: 0; padding: 0; list-style: none; }
+.series-actions li { padding: 12px 0 12px 22px; position: relative; border-bottom: 1px solid var(--line); font-size: 14px; line-height: 1.45; }
+.series-actions li:before { content: "→"; position: absolute; left: 0; color: var(--muted); }
+.reason { padding: 12px 0; display: grid; grid-template-columns: 10px 1fr; gap: 10px; border-bottom: 1px solid var(--line); }
+.reason-dot { width: 8px; height: 8px; margin-top: 5px; border-radius: 50%; background: #aaa; }
+.reason.pos .reason-dot { background: var(--good); }
+.reason.neg .reason-dot { background: var(--accent); }
+.reason.strong b { font-weight: 750; }
+.reason b { display: block; font-size: 13px; font-weight: 600; }
+.reason p { margin: 3px 0 0; color: var(--muted); font-size: 12px; line-height: 1.45; overflow-wrap: anywhere; }
+.series-images { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 10px; }
+.series-image { margin: 0; }
+.series-image img { width: 100%; aspect-ratio: 4 / 3; object-fit: cover; border-radius: 8px; background: #ddd; }
+.series-image figcaption { margin-top: 6px; display: flex; justify-content: space-between; gap: 8px; font-size: 11px; }
+.series-image figcaption span { overflow: hidden; color: var(--muted); white-space: nowrap; text-overflow: ellipsis; }
+.series-image figcaption b.high { color: var(--accent); }
+.series-faces { display: flex; flex-wrap: wrap; gap: 10px; }
+.series-faces figure { margin: 0; text-align: center; }
+.series-faces img { width: 84px; height: 84px; border-radius: 8px; object-fit: cover; }
+.series-faces figcaption { color: var(--muted); font-size: 10px; }
+.face-pair { padding: 10px 0; display: flex; flex-wrap: wrap; justify-content: space-between; gap: 6px 16px; border-bottom: 1px solid var(--line); font-size: 12px; }
+.face-pair span { color: var(--muted); }
+.series-pairs { display: grid; gap: 16px; margin-bottom: 18px; }
+.series-pair { padding: 14px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); }
+.series-pair-top { margin-bottom: 8px; display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 8px; }
+.series-pair-top b { font-size: 13px; }
+.chip { padding: 3px 7px; border-radius: 4px; color: #fff; background: #888; font-size: 10px; font-weight: 700; }
+.chip.consistent_3d { background: var(--good); }
+.chip.inconsistent { background: var(--accent); }
+.chip.planar, .chip.weak { background: #b08a1e; }
+.series-pair p { margin: 0 0 10px; color: var(--muted); font-size: 12px; line-height: 1.45; }
+.series-pair img { width: 100%; border-radius: 6px; }
+.series-pair dl { margin: 8px 0 0; display: flex; flex-wrap: wrap; gap: 4px 14px; color: var(--muted); font-size: 11px; }
+.series-pair dd { margin: 0 0 0 3px; color: var(--text); font-weight: 600; }
+.series-pair dt, .series-pair dd { display: inline; }
+#seriesExif { margin-top: 4px; }
+.scanning .series-thumb:after { content: ""; position: absolute; left: 0; right: 0; top: 0; height: 3px; background: var(--accent); box-shadow: 0 0 8px var(--accent), 0 0 22px rgba(255,84,56,.75); animation: scan 1.6s linear infinite; }
+
+@media (max-width: 640px) {
+  .series-kind { grid-template-columns: 1fr; }
+  .series-thumbs { grid-template-columns: 1fr 1fr; }
+  .series-images { grid-template-columns: 1fr 1fr; }
+}

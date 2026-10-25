@@ -74,3 +74,31 @@ def run_local_model(data: bytes) -> dict[str, Any]:
         "model_size_mb": status["size_mb"],
         "detail": "Локальная ONNX-модель; скрининговый сигнал, а не доказательство происхождения.",
     }
+
+
+MULTIVIEW_WORKER_PATH = ROOT / "multiview_worker.py"
+
+
+def run_multiview(items: list[tuple[str, bytes]], mode: str) -> dict[str, Any]:
+    """Анализ серии в отдельном процессе с лимитами (см. multiview_worker.py)."""
+    header = json.dumps({"mode": mode, "names": [name for name, _ in items], "sizes": [len(data) for _, data in items]}).encode() + b"\n"
+    environment = os.environ.copy()
+    environment.update({"OMP_NUM_THREADS": "1", "OPENBLAS_NUM_THREADS": "1", "MKL_NUM_THREADS": "1", "MALLOC_ARENA_MAX": "2"})
+    try:
+        process = subprocess.run(
+            [sys.executable, str(MULTIVIEW_WORKER_PATH)],
+            input=header + b"".join(data for _, data in items),
+            capture_output=True,
+            timeout=50,
+            check=False,
+            env=environment,
+        )
+    except subprocess.TimeoutExpired:
+        return {"error": "Анализ серии превысил таймаут 50 секунд"}
+    try:
+        payload = json.loads(process.stdout.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return {"error": process.stderr.decode("utf-8", errors="ignore")[-240:] or "Некорректный ответ воркера серии"}
+    if process.returncode != 0 and "error" not in payload:
+        return {"error": "Воркер серии завершился с ошибкой"}
+    return payload

@@ -281,19 +281,298 @@ $('#removeButton').addEventListener('click', (event) => { event.stopPropagation(
 $('#newCheck').addEventListener('click', () => { reset(); window.scrollTo({ top: 0, behavior: 'smooth' }); });
 analyzeButton.addEventListener('click', analyze);
 
-document.addEventListener('paste', (event) => {
+function clipboardImage(event) {
   const clipboard = event.clipboardData;
-  if (!clipboard) return;
+  if (!clipboard) return null;
   const item = Array.from(clipboard.items || []).find((entry) => entry.kind === 'file' && entry.type.startsWith('image/'));
   const file = item?.getAsFile() || Array.from(clipboard.files || []).find((entry) => entry.type.startsWith('image/'));
+  if (!file) return null;
+  const extension = (file.type.split('/')[1] || 'png').replace('jpeg', 'jpg');
+  return file.name ? file : new File([file], `clipboard-${Date.now()}.${extension}`, { type: file.type || 'image/png' });
+}
+
+document.addEventListener('paste', (event) => {
+  const file = clipboardImage(event);
   if (!file) return;
   event.preventDefault();
-  const extension = (file.type.split('/')[1] || 'png').replace('jpeg', 'jpg');
-  const namedFile = file.name ? file : new File([file], `clipboard-${Date.now()}.${extension}`, { type: file.type || 'image/png' });
-  chooseFile(namedFile);
+  if (seriesMode) {
+    addSeriesFiles([file]);
+    $('#seriesDrop').focus();
+    return;
+  }
+  chooseFile(file);
   dropzone.focus();
 });
 
 fetch('/api/providers').then((response) => response.json()).then(renderProviderStatus).catch(() => {
   $('#providerStatus').innerHTML = '<span class="loading-copy">Не удалось получить конфигурацию API</span>';
+});
+
+// ---------------------------------------------------------------- Серия ---
+
+const MAX_SERIES = 6;
+const seriesDrop = $('#seriesDrop');
+const seriesInput = $('#seriesInput');
+const seriesButton = $('#seriesButton');
+const seriesResults = $('#seriesResults');
+let seriesMode = false;
+let seriesFiles = [];
+
+function setMode(series) {
+  seriesMode = series;
+  $('#singleTab').classList.toggle('active', !series);
+  $('#seriesTab').classList.toggle('active', series);
+  $('#singleTab').setAttribute('aria-selected', String(!series));
+  $('#seriesTab').setAttribute('aria-selected', String(series));
+  $('#singlePanel').hidden = series;
+  $('#seriesPanel').hidden = !series;
+  $('#startHint').textContent = series
+    ? 'Загрузите несколько снимков одной сцены или одного человека — проверим, согласуются ли они между собой.'
+    : 'Загрузите файл или вставьте его из буфера.';
+  results.hidden = true;
+  seriesResults.hidden = true;
+}
+
+function seriesUrl(file) {
+  if (!file.previewUrl) file.previewUrl = URL.createObjectURL(file);
+  return file.previewUrl;
+}
+
+function addSeriesFiles(files) {
+  const rejected = [];
+  Array.from(files).forEach((file) => {
+    if (!file.type.startsWith('image/')) rejected.push(`${file.name}: не изображение`);
+    else if (file.size > 20 * 1024 * 1024) rejected.push(`${file.name}: больше 20 МБ`);
+    else if (seriesFiles.length >= MAX_SERIES) rejected.push(`${file.name}: максимум ${MAX_SERIES} снимков`);
+    else seriesFiles.push(file);
+  });
+  if (rejected.length) alert(rejected.join('\n'));
+  renderSeriesThumbs();
+}
+
+function removeSeriesFile(index) {
+  const [file] = seriesFiles.splice(index, 1);
+  if (file?.previewUrl) URL.revokeObjectURL(file.previewUrl);
+  renderSeriesThumbs();
+}
+
+function renderSeriesThumbs() {
+  const root = $('#seriesThumbs');
+  root.innerHTML = '';
+  seriesFiles.forEach((file, index) => {
+    const thumb = document.createElement('div');
+    thumb.className = 'series-thumb';
+    const image = document.createElement('img');
+    image.src = seriesUrl(file);
+    image.alt = file.name;
+    const number = document.createElement('span');
+    number.className = 'num';
+    number.textContent = index + 1;
+    const remove = document.createElement('button');
+    remove.type = 'button';
+    remove.className = 'remove-button';
+    remove.setAttribute('aria-label', `Убрать снимок ${index + 1}`);
+    remove.textContent = '×';
+    remove.addEventListener('click', (event) => { event.stopPropagation(); removeSeriesFile(index); });
+    thumb.title = `${file.name} · ${formatBytes(file.size)}`;
+    thumb.append(image, number, remove);
+    root.append(thumb);
+  });
+  if (seriesFiles.length && seriesFiles.length < MAX_SERIES) {
+    const add = document.createElement('button');
+    add.type = 'button';
+    add.className = 'series-add';
+    add.textContent = '+ ещё снимок';
+    root.append(add);
+  }
+  root.hidden = !seriesFiles.length;
+  $('#seriesEmpty').hidden = Boolean(seriesFiles.length);
+  seriesButton.disabled = seriesFiles.length < 2;
+  setButtonText(seriesButton, seriesFiles.length === 1 ? 'Нужен ещё один снимок' : 'Проверить серию');
+}
+
+function setButtonText(button, text) {
+  const label = button.querySelector('span');
+  if (label) label.textContent = text;
+  else button.textContent = text;
+}
+
+const VERDICT_TEXT = { consistent: 'Согласовано', inconsistent: 'Не согласуется', insufficient: 'Недостаточно данных' };
+const PAIR_TEXT = {
+  consistent_3d: 'согласовано', inconsistent: 'не сходится', planar: 'плоская сцена',
+  near_duplicate: 'почти дубликат', no_overlap: 'нет общих деталей', weak: 'слабое совпадение',
+};
+
+function textElement(tag, text, className) {
+  const element = document.createElement(tag);
+  if (className) element.className = className;
+  element.textContent = text;
+  return element;
+}
+
+function renderSeries(data) {
+  const card = $('#seriesCard');
+  card.className = `series-card ${data.verdict}`;
+  $('#seriesVerdict').textContent = VERDICT_TEXT[data.verdict] || data.verdict;
+  $('#seriesHeadline').textContent = data.headline || '';
+  const modeText = data.mode === 'person' ? 'один человек' : 'одна сцена';
+  const noun = data.count % 10 === 1 && data.count % 100 !== 11 ? 'снимок' : [2, 3, 4].includes(data.count % 10) && ![12, 13, 14].includes(data.count % 100) ? 'снимка' : 'снимков';
+  $('#seriesMeta').textContent = `${data.count} ${noun} · режим: ${modeText}${data.latency_ms ? ` · геометрия ${data.latency_ms} мс` : ''}`;
+
+  const actions = $('#seriesActions');
+  actions.innerHTML = '';
+  (data.recommendations || []).forEach((text) => actions.append(textElement('li', text)));
+
+  const reasons = $('#seriesReasons');
+  reasons.innerHTML = '';
+  (data.reasons || []).forEach((item) => {
+    const row = document.createElement('div');
+    row.className = `reason ${item.level} ${item.polarity > 0 ? 'pos' : item.polarity < 0 ? 'neg' : 'neutral'}`;
+    const body = document.createElement('div');
+    body.append(textElement('b', item.title), textElement('p', item.detail));
+    row.append(textElement('span', '', 'reason-dot'), body);
+    reasons.append(row);
+  });
+  if (!reasons.children.length) reasons.append(textElement('p', 'Явных сигналов нет.', 'empty-copy'));
+
+  const images = $('#seriesImages');
+  images.innerHTML = '';
+  (data.images || []).forEach((item) => {
+    const figure = document.createElement('figure');
+    figure.className = 'series-image';
+    const image = document.createElement('img');
+    image.src = seriesFiles[item.index] ? seriesUrl(seriesFiles[item.index]) : '';
+    image.alt = item.filename;
+    const caption = document.createElement('figcaption');
+    const percent = Number.isFinite(item.percent) ? `${item.percent}% AI` : '—';
+    caption.append(textElement('span', `${item.index + 1}. ${item.filename}`), textElement('b', percent, item.percent >= 65 ? 'high' : ''));
+    caption.title = item.headline || '';
+    figure.append(image, caption);
+    images.append(figure);
+  });
+
+  const faces = data.faces;
+  $('#seriesFacesBlock').hidden = !faces;
+  if (faces) {
+    const faceRoot = $('#seriesFaces');
+    faceRoot.innerHTML = '';
+    faces.faces.forEach((face, index) => {
+      const figure = document.createElement('figure');
+      if (face) {
+        const image = document.createElement('img');
+        image.src = face.crop;
+        image.alt = `Лицо на снимке ${index + 1}`;
+        figure.append(image, textElement('figcaption', `Снимок ${index + 1} · ${face.size_px}px`));
+      } else {
+        figure.append(textElement('figcaption', `Снимок ${index + 1}: лицо не найдено`));
+      }
+      faceRoot.append(figure);
+    });
+    const pairRoot = $('#seriesFacePairs');
+    pairRoot.innerHTML = '';
+    faces.pairs.forEach((pair) => {
+      const row = document.createElement('div');
+      row.className = 'face-pair';
+      row.append(
+        textElement('b', `Снимки ${pair.a + 1} и ${pair.b + 1}: ${pair.same_person ? 'тот же человек' : 'не совпадает'}`),
+        textElement('span', `сходство ${pair.cosine.toFixed(2)} · идентичность пикселей ${pair.face_ssim.toFixed(2)}${pair.pose_diff_deg !== null ? ` · поворот головы ${pair.pose_diff_deg}°` : ''}`),
+      );
+      pairRoot.append(row);
+    });
+  }
+
+  const pairs = $('#seriesPairs');
+  pairs.innerHTML = '';
+  (data.pairs || []).forEach((pair) => {
+    const box = document.createElement('article');
+    box.className = 'series-pair';
+    const top = document.createElement('div');
+    top.className = 'series-pair-top';
+    top.append(textElement('b', `Снимки ${pair.a + 1} и ${pair.b + 1}`), textElement('span', PAIR_TEXT[pair.status] || pair.status, `chip ${pair.status}`));
+    box.append(top, textElement('p', pair.detail || ''));
+    if (pair.visual) {
+      const image = document.createElement('img');
+      image.src = pair.visual;
+      image.alt = `Совпадения между снимками ${pair.a + 1} и ${pair.b + 1}`;
+      image.loading = 'lazy';
+      box.append(image);
+    }
+    const stats = document.createElement('dl');
+    [
+      ['Совпадений', pair.matches],
+      ['Согласованных', pair.inliers],
+      ['Покрытие', Number.isFinite(pair.coverage) ? `${Math.round(pair.coverage * 100)}%` : null],
+      ['Перед камерой', pair.cheirality ? `${Math.round(pair.cheirality.ratio * 100)}%` : null],
+      ['Без пары', Number.isFinite(pair.suspicious_share) ? `${Math.round(pair.suspicious_share * 100)}%` : null],
+    ].forEach(([name, value]) => {
+      if (value === null || value === undefined) return;
+      const group = document.createElement('div');
+      group.append(textElement('dt', `${name}:`), textElement('dd', String(value)));
+      stats.append(group);
+    });
+    box.append(stats);
+    pairs.append(box);
+  });
+
+  const exif = data.exif_series || {};
+  const facts = [
+    ['EXIF', `${exif.with_exif ?? 0} из ${data.count}`],
+    ['Устройства', (exif.devices || []).join(', ') || '—'],
+    ['Разброс времени', exif.time_span_s !== null && exif.time_span_s !== undefined ? `${Math.round(exif.time_span_s)} с` : '—'],
+    ['Разброс GPS', exif.gps_max_distance_m !== null && exif.gps_max_distance_m !== undefined ? `${exif.gps_max_distance_m} м` : '—'],
+  ];
+  const exifRoot = $('#seriesExif');
+  exifRoot.innerHTML = '';
+  facts.forEach(([key, value]) => {
+    const fact = document.createElement('div');
+    fact.className = 'fact';
+    fact.append(textElement('span', key), textElement('b', value));
+    exifRoot.append(fact);
+  });
+
+  seriesResults.hidden = false;
+  seriesResults.scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
+async function analyzeSeries() {
+  if (seriesFiles.length < 2) return;
+  seriesButton.disabled = true;
+  setButtonText(seriesButton, 'Анализируем серию…');
+  seriesDrop.classList.add('scanning');
+  try {
+    const form = new FormData();
+    seriesFiles.forEach((file) => form.append('files', file, file.name));
+    const mode = document.querySelector('input[name="seriesMode"]:checked').value;
+    const remote = $('#seriesRemote').checked;
+    const response = await fetch(`/api/analyze-set?mode=${mode}&remote=${remote}`, { method: 'POST', body: form });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.detail || 'Не удалось проверить серию');
+    renderSeries(data);
+  } catch (error) {
+    alert(error.message || 'Ошибка проверки серии');
+  } finally {
+    seriesButton.disabled = seriesFiles.length < 2;
+    setButtonText(seriesButton, 'Проверить ещё раз');
+    seriesDrop.classList.remove('scanning');
+  }
+}
+
+$('#singleTab').addEventListener('click', () => setMode(false));
+$('#seriesTab').addEventListener('click', () => setMode(true));
+$('#seriesPick').addEventListener('click', (event) => { event.stopPropagation(); seriesInput.click(); });
+seriesDrop.addEventListener('click', (event) => {
+  if (!event.target.closest('button') || event.target.closest('.series-add')) seriesInput.click();
+});
+seriesDrop.addEventListener('keydown', (event) => { if (event.key === 'Enter' || event.key === ' ') seriesInput.click(); });
+seriesInput.addEventListener('change', () => { addSeriesFiles(seriesInput.files); seriesInput.value = ''; });
+['dragenter', 'dragover'].forEach((name) => seriesDrop.addEventListener(name, (event) => { event.preventDefault(); seriesDrop.classList.add('dragging'); }));
+['dragleave', 'drop'].forEach((name) => seriesDrop.addEventListener(name, (event) => { event.preventDefault(); seriesDrop.classList.remove('dragging'); }));
+seriesDrop.addEventListener('drop', (event) => addSeriesFiles(event.dataTransfer.files));
+seriesButton.addEventListener('click', analyzeSeries);
+$('#seriesNew').addEventListener('click', () => {
+  seriesFiles.forEach((file) => file.previewUrl && URL.revokeObjectURL(file.previewUrl));
+  seriesFiles = [];
+  renderSeriesThumbs();
+  seriesResults.hidden = true;
+  window.scrollTo({ top: 0, behavior: 'smooth' });
 });

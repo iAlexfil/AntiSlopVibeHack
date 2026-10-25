@@ -7,14 +7,15 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from PIL import ExifTags, Image, UnidentifiedImageError
 from dotenv import load_dotenv
 
 from forensics import run_forensics
-from local_model import run_local_model
+from local_model import run_local_model, run_multiview
+import series
 from services import analyze_with_services, merge_service_results, provider_catalog
 
 
@@ -253,6 +254,22 @@ async def _run_local_model_limited(data: bytes) -> dict[str, Any]:
         return await asyncio.to_thread(run_local_model, data)
 
 
+async def run_pipeline(data: bytes, filename: str, mime_type: str, remote: bool) -> dict[str, Any]:
+    """Полный анализ: метаданные + криминалистика + локальная модель + опциональные API."""
+    result = analyze_image(data, filename)
+    local_model_task = _run_local_model_limited(data)
+    if remote:
+        local_result, api_results = await asyncio.gather(
+            local_model_task,
+            analyze_with_services(data, filename, mime_type),
+        )
+    else:
+        local_result = await local_model_task
+        api_results = []
+    result["local_model"] = local_result
+    return merge_service_results(result, [local_result, *api_results])
+
+
 @app.post("/api/analyze")
 async def analyze(request: Request, filename: str = "image", remote: bool = True) -> JSONResponse:
     content_length = request.headers.get("content-length")
@@ -262,20 +279,67 @@ async def analyze(request: Request, filename: str = "image", remote: bool = True
     except ValueError as error:
         raise HTTPException(400, "Некорректный Content-Length") from error
     data = await _read_limited_body(request)
-    result = analyze_image(data, filename)
-    local_model_task = _run_local_model_limited(data)
-    if remote:
-        mime_type = request.headers.get("content-type", "application/octet-stream").split(";", 1)[0]
-        local_result, api_results = await asyncio.gather(
-            local_model_task,
-            analyze_with_services(data, filename, mime_type),
-        )
-    else:
-        local_result = await local_model_task
-        api_results = []
-    result["local_model"] = local_result
-    result = merge_service_results(result, [local_result, *api_results])
+    mime_type = request.headers.get("content-type", "application/octet-stream").split(";", 1)[0]
+    result = await run_pipeline(data, filename, mime_type, remote)
     return JSONResponse(result)
+
+
+async def _run_multiview_limited(items: list[tuple[str, bytes]], mode: str) -> dict[str, Any]:
+    # Геометрия и лица тоже тяжёлые: делят тот же семафор, что и ML-воркер.
+    async with LOCAL_MODEL_GATE:
+        return await asyncio.to_thread(run_multiview, items, mode)
+
+
+async def run_series(items: list[tuple[str, bytes, str]], mode: str, remote: bool) -> dict[str, Any]:
+    """Каждый снимок — обычный пайплайн, затем проверки согласованности серии в отдельном воркере."""
+    summaries = []
+    for index, (name, data, mime_type) in enumerate(items):
+        try:
+            result = await run_pipeline(data, name, mime_type, remote)
+        except HTTPException as error:
+            raise HTTPException(error.status_code, f"Снимок {index + 1} ({name}): {error.detail}") from error
+        summaries.append(series.image_summary(index, name, result))
+
+    multiview = await _run_multiview_limited([(name, data) for name, data, _ in items], mode)
+    if "error" in multiview:
+        raise HTTPException(500, f"Не удалось проанализировать серию: {multiview['error']}")
+
+    face_background = []
+    for face in (multiview.get("faces") or {}).get("faces", []):
+        if not face or face["size_px"] < series.FACE_BACKGROUND_MIN_PX:
+            continue
+        face_bytes, background_bytes = series.face_background_crops(items[face["image"]][1], face["box"])
+        if background_bytes is None:
+            continue  # лицо занимает почти весь кадр — чистого фона для сравнения нет
+        face_score = await _run_local_model_limited(face_bytes)
+        background_score = await _run_local_model_limited(background_bytes)
+        face_background.append({
+            "image": face["image"],
+            "face": face_score.get("score") if face_score.get("status") == "ok" else None,
+            "background": background_score.get("score") if background_score.get("status") == "ok" else None,
+        })
+    return series.finalize(multiview, summaries, face_background)
+
+
+@app.post("/api/analyze-set")
+async def analyze_set(
+    request: Request,
+    files: list[UploadFile] = File(...),
+    mode: str = Query("scene", pattern="^(scene|person)$"),
+    remote: bool = False,
+) -> JSONResponse:
+    content_length = request.headers.get("content-length")
+    if content_length and content_length.isdigit() and int(content_length) > series.MAX_SERIES_IMAGES * MAX_FILE_SIZE + 1024 * 1024:
+        raise HTTPException(413, "Серия больше допустимого размера")
+    if not series.MIN_SERIES_IMAGES <= len(files) <= series.MAX_SERIES_IMAGES:
+        raise HTTPException(400, f"Загрузите от {series.MIN_SERIES_IMAGES} до {series.MAX_SERIES_IMAGES} снимков")
+    items = []
+    for index, upload in enumerate(files):
+        data = await upload.read(MAX_FILE_SIZE + 1)
+        if len(data) > MAX_FILE_SIZE:
+            raise HTTPException(413, f"Снимок {index + 1} больше 20 МБ")
+        items.append((upload.filename or f"image-{index + 1}", data, upload.content_type or "application/octet-stream"))
+    return JSONResponse(await run_series(items, mode, remote))
 
 
 @app.exception_handler(HTTPException)
