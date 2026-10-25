@@ -33,9 +33,9 @@ main { width: min(720px, calc(100% - 32px)); margin: 0 auto; }
 .preview-state img { width: 100%; height: 100%; object-fit: contain; }
 .file-badge { position: absolute; left: 12px; bottom: 12px; max-width: calc(100% - 70px); padding: 6px 8px; border-radius: 5px; color: #fff; background: rgba(0,0,0,.7); font-size: 10px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .remove-button { position: absolute; top: 12px; right: 12px; width: 32px; height: 32px; border: 0; border-radius: 50%; color: #fff; background: rgba(0,0,0,.7); font-size: 21px; cursor: pointer; }
-.scan-line { position: absolute; left: 0; right: 0; top: -2px; height: 2px; opacity: 0; background: #fff; }
-.scanning .scan-line { opacity: 1; animation: scan 1.4s ease-in-out infinite; }
-@keyframes scan { 50% { top: calc(100% - 2px); } }
+.scan-line { position: absolute; z-index: 3; left: 0; right: 0; top: 0; height: 3px; opacity: 0; pointer-events: none; background: var(--accent); box-shadow: 0 0 8px var(--accent), 0 0 22px rgba(255,84,56,.75); }
+.scanning .scan-line { opacity: 1; animation: scan 1.45s ease-in-out infinite alternate; }
+@keyframes scan { from { transform: translateY(0); } to { transform: translateY(327px); } }
 
 .actions { margin-top: 14px; display: flex; align-items: center; justify-content: space-between; gap: 16px; }
 .remote-toggle { display: flex; align-items: center; gap: 9px; color: var(--muted); font-size: 11px; cursor: pointer; }
@@ -132,6 +132,7 @@ main { width: min(720px, calc(100% - 32px)); margin: 0 auto; }
 @media (max-width: 640px) {
   .start { padding: 46px 0 64px; }
   .dropzone { min-height: 300px; }
+  @keyframes scan { from { transform: translateY(0); } to { transform: translateY(297px); } }
   .actions { align-items: stretch; flex-direction: column; }
   .primary-button { width: 100%; }
   .results { padding-top: 36px; }

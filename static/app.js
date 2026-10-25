@@ -6,6 +6,12 @@ const preview = $('#preview');
 const results = $('#results');
 let selectedFile = null;
 
+function setAnalyzeButtonText(text) {
+  const label = analyzeButton.querySelector('span');
+  if (label) label.textContent = text;
+  else analyzeButton.textContent = text;
+}
+
 const formatBytes = (bytes) => {
   if (bytes < 1024) return `${bytes} Б`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} КБ`;
@@ -21,7 +27,7 @@ function reset() {
   $('#previewState').hidden = true;
   $('#emptyState').hidden = false;
   analyzeButton.disabled = true;
-  analyzeButton.querySelector('span').textContent = 'Проверить изображение';
+  setAnalyzeButtonText('Проверить');
   dropzone.classList.remove('scanning');
   results.hidden = true;
 }
@@ -241,7 +247,7 @@ function renderResult(data) {
 async function analyze() {
   if (!selectedFile) return;
   analyzeButton.disabled = true;
-  analyzeButton.querySelector('span').textContent = 'Анализируем…';
+  setAnalyzeButtonText('Анализируем…');
   dropzone.classList.add('scanning');
   try {
     const remote = $('#useRemote').checked;
@@ -257,7 +263,7 @@ async function analyze() {
     alert(error.message || 'Ошибка проверки');
   } finally {
     analyzeButton.disabled = false;
-    analyzeButton.querySelector('span').textContent = 'Проверить ещё раз';
+    setAnalyzeButtonText('Проверить ещё раз');
     dropzone.classList.remove('scanning');
   }
 }
