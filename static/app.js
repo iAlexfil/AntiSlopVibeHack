@@ -81,22 +81,19 @@ function renderOverall(data) {
 
 function renderBreakdown(data) {
   const root = $('#breakdownGrid');
-  const icons = { model: 'ML', semantic: 'AI', external: 'API', provenance: 'C2', pixels: 'PX' };
   root.innerHTML = '';
   (data.probability_breakdown || []).forEach((item) => {
     const numeric = Number.isFinite(item.percent);
     const tone = !numeric ? 'missing' : item.percent >= 65 ? 'high' : item.percent >= 36 ? 'mid' : 'low';
-    const card = document.createElement('article');
-    card.className = `breakdown-card ${tone}`;
-    card.innerHTML = '<div class="breakdown-top"><span class="breakdown-icon"></span><span class="breakdown-state"></span></div><strong class="breakdown-number"></strong><h3></h3><p></p><div class="breakdown-bar"><span></span></div>';
-    card.querySelector('.breakdown-icon').textContent = icons[item.id] || '•';
-    card.querySelector('.breakdown-state').textContent = !numeric ? 'нет данных' : item.percent >= 65 ? 'сильный сигнал' : item.percent >= 36 ? 'средний сигнал' : 'слабый сигнал';
-    const number = card.querySelector('.breakdown-number');
+    const card = document.createElement('div');
+    card.className = `metric ${tone}`;
+    card.title = item.detail;
+    card.innerHTML = '<div class="metric-main"><span></span><strong></strong></div><div class="metric-bar"><span></span></div>';
+    card.querySelector('.metric-main span').textContent = item.title;
+    const number = card.querySelector('strong');
     number.textContent = numeric ? `${item.percent}%` : '—';
     if (!numeric) number.classList.add('missing');
-    card.querySelector('h3').textContent = item.title;
-    card.querySelector('p').textContent = item.detail;
-    card.querySelector('.breakdown-bar span').style.width = numeric ? `${item.percent}%` : '0%';
+    card.querySelector('.metric-bar span').style.width = numeric ? `${item.percent}%` : '0%';
     root.append(card);
   });
 }
