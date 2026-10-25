@@ -5,6 +5,7 @@ const analyzeButton = $('#analyzeButton');
 const preview = $('#preview');
 const results = $('#results');
 let selectedFile = null;
+let analysisVersion = 0;
 
 function setAnalyzeButtonText(text) {
   const label = analyzeButton.querySelector('span');
@@ -19,6 +20,7 @@ const formatBytes = (bytes) => {
 };
 
 function reset() {
+  analysisVersion += 1;
   if (preview.src) URL.revokeObjectURL(preview.src);
   selectedFile = null;
   fileInput.value = '';
@@ -41,6 +43,7 @@ function chooseFile(file) {
     alert('Максимальный размер файла — 20 МБ.');
     return;
   }
+  analysisVersion += 1;
   if (preview.src) URL.revokeObjectURL(preview.src);
   selectedFile = file;
   preview.src = URL.createObjectURL(file);
@@ -48,6 +51,8 @@ function chooseFile(file) {
   $('#previewState').hidden = false;
   $('#emptyState').hidden = true;
   analyzeButton.disabled = false;
+  setAnalyzeButtonText('Проверить');
+  dropzone.classList.remove('scanning');
   results.hidden = true;
 }
 
@@ -78,7 +83,7 @@ function renderOverall(data) {
   $('#probabilityValue').textContent = numeric ? `${value}%` : '—';
   $('#probabilityFill').style.width = numeric ? `${value}%` : '0%';
   $('#resultLabel').textContent = !numeric ? 'Недостаточно данных' : value >= 65 ? 'Высокая вероятность' : value <= 35 ? 'Низкая вероятность' : 'Неоднозначный результат';
-  $('#resultHeadline').textContent = data.headline || 'Анализ завершён';
+  $('#resultHeadline').textContent = !numeric ? 'Недостаточно данных' : data.headline || 'Анализ завершён';
   $('#resultSummary').textContent = numeric
     ? `Итоговая оценка: ${value}%. Она собрана из доступных модельных ответов и подтверждённых признаков происхождения.`
     : 'Вероятностные модели не ответили. Отсутствие метаданных само по себе ничего не доказывает.';
@@ -148,7 +153,7 @@ function renderApiResults(data) {
   const root = $('#apiResults');
   const items = data.api_results || [];
   root.innerHTML = '';
-  $('#apiConsensus').textContent = data.api_summary?.checked ? `${data.api_summary.ai_votes}/${data.api_summary.checked} ответов за AI` : 'Только локальные эвристики';
+  $('#apiConsensus').textContent = data.api_summary?.checked ? `Ответили источников: ${data.api_summary.checked}; ошибок: ${data.api_summary.failed}` : 'Нет ответов моделей и сервисов';
   if (!items.length) {
     root.innerHTML = '<div class="api-result"><h4>Внешние API отключены</h4><p>Для этого запуска файл остался локально.</p></div>';
     return;
@@ -157,12 +162,19 @@ function renderApiResults(data) {
     const card = document.createElement('article');
     const verdict = item.verdict || item.status;
     card.className = `api-result ${item.status} ${verdict}`;
-    const label = item.status === 'ok' ? item.verdict === 'ai' ? 'AI' : item.verdict === 'unknown' ? 'UNKNOWN' : 'HUMAN' : item.status === 'error' ? 'ERROR' : item.status === 'unavailable' ? 'NO API' : 'NO KEY';
+    let label = item.status === 'ok' ? item.verdict === 'ai' ? 'AI' : item.verdict === 'unknown' ? 'UNKNOWN' : 'HUMAN' : item.status === 'error' ? 'ERROR' : item.status === 'unavailable' ? 'НЕДОСТУПЕН' : item.status === 'unsupported' ? 'ФОРМАТ' : 'NO KEY';
+    if (item.provenance && item.status === 'ok') label = item.verdict === 'ai' ? 'НАЙДЕНО' : 'НЕ НАЙДЕНО';
     card.innerHTML = '<div class="api-result-top"><h4></h4><span class="status"></span></div><div class="api-score"></div><p></p>';
     card.querySelector('h4').textContent = item.name;
     card.querySelector('.status').textContent = label;
-    card.querySelector('.api-score').textContent = item.status === 'ok' ? `${Math.round(item.score * 100)}%` : '—';
+    card.querySelector('.api-score').textContent = item.provenance && item.status === 'ok'
+      ? item.verdict === 'ai' ? 'Признак найден' : 'Не обнаружено'
+      : item.status === 'ok' && Number.isFinite(item.score) ? `${Math.round(item.score * 100)}%` : '-';
     card.querySelector('p').textContent = item.detail || '';
+    (item.checks || []).forEach((check) => {
+      const metadata = [check.validation_state, check.issuer, check.model, check.generated_at].filter(Boolean);
+      if (metadata.length) appendDetail(card, check.type === 'synthid' ? 'SynthID' : 'C2PA', metadata.join('; '));
+    });
     if (item.generator) {
       const generator = document.createElement('span');
       generator.className = 'api-generator';
@@ -248,6 +260,7 @@ function renderResult(data) {
 
 async function analyze() {
   if (!selectedFile) return;
+  const requestVersion = ++analysisVersion;
   analyzeButton.disabled = true;
   setAnalyzeButtonText('Анализируем…');
   dropzone.classList.add('scanning');
@@ -259,14 +272,17 @@ async function analyze() {
       body: selectedFile,
     });
     const data = await response.json();
+    if (requestVersion !== analysisVersion) return;
     if (!response.ok) throw new Error(data.detail || 'Не удалось проверить файл');
     renderResult(data);
   } catch (error) {
-    alert(error.message || 'Ошибка проверки');
+    if (requestVersion === analysisVersion) alert(error.message || 'Ошибка проверки');
   } finally {
-    analyzeButton.disabled = false;
-    setAnalyzeButtonText('Проверить ещё раз');
-    dropzone.classList.remove('scanning');
+    if (requestVersion === analysisVersion) {
+      analyzeButton.disabled = false;
+      setAnalyzeButtonText('Проверить ещё раз');
+      dropzone.classList.remove('scanning');
+    }
   }
 }
 

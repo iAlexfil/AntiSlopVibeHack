@@ -58,10 +58,9 @@ PROVIDER_CATALOG = (
     },
     {
         "id": "synthid",
-        "name": "Google SynthID",
-        "env": (),
-        "docs": "https://deepmind.google/science/synthid/",
-        "unavailable": "Публичного API детектора изображений нет.",
+        "name": "OpenAI SynthID / C2PA",
+        "env": ("OPENAI_API_KEY",),
+        "docs": "https://developers.openai.com/api/docs/guides/content-provenance",
     },
 )
 
@@ -193,6 +192,71 @@ async def _openai_vision(client: httpx.AsyncClient, data: bytes, filename: str, 
     return result
 
 
+async def _openai_provenance(client: httpx.AsyncClient, data: bytes, filename: str, mime_type: str) -> ProviderResult:
+    del filename, mime_type
+    name = "OpenAI SynthID / C2PA"
+    with Image.open(io.BytesIO(data)) as image:
+        image_format = image.format
+    media_types = {"PNG": "image/png", "JPEG": "image/jpeg", "WEBP": "image/webp"}
+    if image_format not in media_types:
+        return {
+            "name": name, "status": "unsupported", "provenance": True,
+            "detail": "Проверка SynthID / C2PA через OpenAI поддерживает только исходные PNG, JPEG и WebP.",
+        }
+
+    # Проверяем оригинальные байты: ресайз и перекодирование могут уничтожить метки.
+    response = await client.post(
+        "https://api.openai.com/v1/content_provenance_checks",
+        headers={"Authorization": f"Bearer {os.environ['OPENAI_API_KEY']}"},
+        files={"file": (f"image.{image_format.lower()}", data, media_types[image_format])},
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, dict) or payload.get("object") != "content_provenance_check" or not isinstance(payload.get("results"), list):
+        raise ValueError("OpenAI вернул некорректный ответ проверки происхождения")
+
+    checks: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in payload["results"]:
+        if not isinstance(item, dict):
+            raise ValueError("OpenAI вернул некорректную проверку происхождения")
+        signal_type = item.get("type")
+        if signal_type not in ("synthid", "c2pa"):
+            continue
+        if signal_type in seen or item.get("outcome") not in ("detected", "not_detected"):
+            raise ValueError("OpenAI вернул некорректный результат проверки происхождения")
+        seen.add(signal_type)
+        check = {"type": signal_type, "outcome": item["outcome"]}
+        fields = ["model", "generated_at"]
+        if signal_type == "c2pa":
+            state = item.get("validation_state")
+            if state not in ("trusted", "valid", "invalid", "not_present") or (item["outcome"] == "detected" and state not in ("trusted", "valid")):
+                raise ValueError("OpenAI вернул противоречивый результат C2PA")
+            check["validation_state"] = state
+            fields.append("issuer")
+        for field in fields:
+            value = item.get(field)
+            if value is not None and not isinstance(value, str):
+                raise ValueError("OpenAI вернул некорректные сведения о происхождении")
+            check[field] = value[:240] if value is not None else None
+        checks.append(check)
+    if not checks:
+        raise ValueError("OpenAI не вернул применимых проверок SynthID / C2PA")
+
+    detected = any(item["outcome"] == "detected" for item in checks)
+    descriptions = [
+        f"{'SynthID' if item['type'] == 'synthid' else 'C2PA'}: "
+        + ("обнаружен" if item["outcome"] == "detected" else "не обнаружен")
+        for item in checks
+    ]
+    return {
+        "name": name, "status": "ok", "score": None,
+        "verdict": "ai" if detected else "unknown", "provenance": True,
+        "checks": checks,
+        "detail": "; ".join(descriptions) + ". Проверяются только поддерживаемые метки OpenAI; отсутствие меток не исключает AI-генерацию.",
+    }
+
+
 async def _hive(client: httpx.AsyncClient, data: bytes, filename: str, mime_type: str) -> ProviderResult:
     response = await client.post(
         "https://api.thehive.ai/api/v2/task/sync",
@@ -278,6 +342,7 @@ async def _wasitai(client: httpx.AsyncClient, data: bytes, filename: str, mime_t
 
 RUNNERS: dict[str, ProviderCall] = {
     "openai_vision": _openai_vision,
+    "synthid": _openai_provenance,
     "hive": _hive,
     "sightengine": _sightengine,
     "aiornot": _aiornot,
@@ -301,11 +366,30 @@ async def _run_one(
         result["id"] = provider_id
         return result
     except (httpx.HTTPError, ValueError, KeyError, TypeError) as error:
+        status = "error"
+        detail = str(error)[:240] or "Ошибка API"
+        if provider_id == "synthid":
+            if isinstance(error, httpx.HTTPStatusError):
+                code = error.response.status_code
+                detail = {
+                    400: "OpenAI отклонил файл: он повреждён, не поддерживается или заблокирован.",
+                    401: "OpenAI не принял API-ключ. Проверьте серверную настройку OPENAI_API_KEY.",
+                    403: "OpenAI запретил доступ к проверке происхождения для этого проекта.",
+                    404: "Проверка происхождения OpenAI недоступна этой организации.",
+                    429: "Достигнут лимит проверок происхождения OpenAI. Повторите позже.",
+                }.get(code, f"Проверка происхождения OpenAI временно недоступна (HTTP {code}).")
+                status = "unavailable" if code == 404 else "error"
+            elif isinstance(error, httpx.TimeoutException):
+                detail = "OpenAI не ответил на проверку происхождения за отведённое время."
+            elif isinstance(error, httpx.HTTPError):
+                detail = "Не удалось связаться с OpenAI для проверки происхождения."
+            else:
+                detail = "OpenAI вернул некорректный результат проверки происхождения."
         return {
             "id": provider_id,
             "name": name,
-            "status": "error",
-            "detail": str(error)[:240] or "Ошибка API",
+            "status": status,
+            "detail": detail,
             "latency_ms": round((time.monotonic() - started) * 1000),
         }
 
@@ -344,12 +428,14 @@ async def analyze_with_services(data: bytes, filename: str, mime_type: str) -> l
 
 
 def merge_service_results(local: dict[str, Any], api_results: list[ProviderResult]) -> dict[str, Any]:
-    successful = [item for item in api_results if item.get("status") == "ok" and item.get("verdict") != "unknown"]
+    completed = [item for item in api_results if item.get("status") == "ok"]
+    successful = [item for item in completed if not item.get("provenance") and item.get("verdict") != "unknown"]
     failed = [item for item in api_results if item.get("status") == "error"]
+    remote_provenance = next((item for item in completed if item.get("provenance") and item.get("verdict") == "ai"), None)
     scores = [float(item["score"]) for item in successful]
     provenance_score: float | None = None
     finding_kinds = {item.get("kind") for item in local.get("findings", []) if item.get("level") == "strong"}
-    if "c2pa_generative" in finding_kinds:
+    if "c2pa_generative" in finding_kinds or remote_provenance:
         provenance_score = 0.99
     elif finding_kinds & {"provider", "generation_metadata"}:
         provenance_score = 0.95
@@ -361,16 +447,16 @@ def merge_service_results(local: dict[str, Any], api_results: list[ProviderResul
     ai_votes = sum(score >= 0.5 for score in scores)
     local["api_results"] = api_results
     local["api_summary"] = {
-        "checked": len(successful),
+        "checked": len(completed),
         "failed": len(failed),
-        "configured": len(successful) + len(failed),
+        "configured": sum(item.get("status") not in {"not_configured", "unavailable"} or item.get("latency_ms") is not None for item in api_results),
         "score": round(consensus, 4) if consensus is not None else None,
-        "ai_votes": ai_votes,
+        "ai_votes": sum(item.get("verdict") == "ai" for item in completed),
     }
 
     source_names = [str(item.get("name", "детектор")) for item in successful]
     if provenance_score is not None:
-        source_names.append("метаданные происхождения")
+        source_names.append(str(remote_provenance["name"]) if remote_provenance else "метаданные происхождения")
     if consensus is None:
         percent = None
         probability_label = "Недостаточно данных"
@@ -382,14 +468,14 @@ def merge_service_results(local: dict[str, Any], api_results: list[ProviderResul
         if spread >= 0.45:
             probability_label = "Низкая согласованность"
         elif len(probability_inputs) == 1:
-            probability_label = "Один модельный сигнал"
+            probability_label = "Один источник оценки"
         else:
             probability_label = "Сводная оценка"
         probability_detail = "Основание: " + ", ".join(source_names)
         if spread >= 0.45:
             probability_detail += ". Детекторы сильно расходятся — процент ненадёжен."
 
-        if local["verdict"] == "detected" or ai_votes > len(scores) / 2 or consensus >= 0.65:
+        if local["verdict"] == "detected" or remote_provenance or ai_votes > len(scores) / 2 or consensus >= 0.65:
             local["verdict"] = "detected"
             local["headline"] = "Есть признаки AI‑происхождения"
         elif ai_votes == 0 and consensus <= 0.35:
@@ -419,7 +505,7 @@ def _probability_breakdown(local: dict[str, Any], results: list[ProviderResult])
     semantic = next((item for item in successful if item.get("id") == "openai_vision"), None)
     external = [
         item for item in successful
-        if item.get("id") not in {"local_frontier", "openai_vision"} and item.get("verdict") != "unknown"
+        if item.get("id") not in {"local_frontier", "openai_vision"} and not item.get("provenance") and item.get("verdict") != "unknown"
     ]
 
     finding_kinds = {str(item.get("kind")) for item in local.get("findings", [])}
@@ -438,6 +524,16 @@ def _probability_breakdown(local: dict[str, Any], results: list[ProviderResult])
     else:
         provenance = 0
         provenance_detail = "AI-сигнатуры, C2PA-указание и видимый бейдж не найдены."
+
+    remote_provenance = next((item for item in results if item.get("id") == "synthid"), None)
+    if remote_provenance:
+        if remote_provenance.get("status") == "ok" and remote_provenance.get("verdict") == "ai":
+            provenance = 99
+            provenance_detail = remote_provenance["detail"]
+        else:
+            provenance_detail += " OpenAI SynthID / C2PA: " + remote_provenance.get("detail", "нет результата")
+    else:
+        provenance_detail += " Внешняя проверка SynthID / C2PA не выполнялась."
 
     forensic_signals = [
         signal for signal in (local.get("forensics") or {}).get("signals", [])
@@ -484,7 +580,7 @@ def _probability_breakdown(local: dict[str, Any], results: list[ProviderResult])
             "title": "Вотермарки и происхождение",
             "percent": provenance,
             "detail": provenance_detail,
-            "source_count": 1,
+            "source_count": 1 + int(bool(remote_provenance and remote_provenance.get("status") == "ok")),
         },
         {
             "id": "pixels",
