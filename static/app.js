@@ -4,72 +4,248 @@ const fileInput = $('#fileInput');
 const analyzeButton = $('#analyzeButton');
 const preview = $('#preview');
 const results = $('#results');
+const remoteToggle = $('#useRemote');
+const imagePickButtons = Array.from(document.querySelectorAll('[data-pick-image], #pickButton'));
+const asArray = (value) => Array.isArray(value) ? value : [];
+const initialButtonText = analyzeButton.querySelector('span')?.textContent.trim() || 'Проверить изображение';
+const supportedTypes = new Set(['image/png', 'image/x-png', 'image/jpeg', 'image/pjpeg', 'image/webp', 'image/gif', 'image/tiff', 'image/x-tiff', 'image/bmp', 'image/x-bmp', 'image/x-ms-bmp']);
+const supportedExtension = /\.(png|jpe?g|webp|gif|tiff?|bmp)$/i;
 let selectedFile = null;
-let analysisVersion = 0;
+let previewUrl = null;
+let isAnalyzing = false;
+let previewAvailable = false;
+let configuredProviders = null;
+let lastRemoteEnabled = remoteToggle.checked;
+let stageTimer = null;
+let dragDepth = 0;
 
-function setAnalyzeButtonText(text) {
-  const label = analyzeButton.querySelector('span');
-  if (label) label.textContent = text;
-  else analyzeButton.textContent = text;
+function setText(selector, value) {
+  const element = $(selector);
+  if (element) element.textContent = value;
 }
 
-const formatBytes = (bytes) => {
+function setAnalyzeButtonText(value) {
+  const label = analyzeButton.querySelector('span');
+  if (label) label.textContent = value;
+  else analyzeButton.textContent = value;
+}
+
+function formatBytes(bytes) {
+  if (!Number.isFinite(bytes)) return '—';
   if (bytes < 1024) return `${bytes} Б`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} КБ`;
   return `${(bytes / 1024 / 1024).toFixed(1)} МБ`;
-};
+}
 
-function reset() {
-  analysisVersion += 1;
-  if (preview.src) URL.revokeObjectURL(preview.src);
-  selectedFile = null;
-  fileInput.value = '';
+function plural(count, one, few, many) {
+  const lastTwo = count % 100;
+  if (lastTwo >= 11 && lastTwo <= 14) return many;
+  return count % 10 === 1 ? one : count % 10 >= 2 && count % 10 <= 4 ? few : many;
+}
+
+function motionBehavior() {
+  return window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth';
+}
+
+function setState(state) {
+  document.body.dataset.state = state;
+  const labels = { idle: 'Ожидает изображение', ready: 'Готово к проверке', analyzing: 'Идёт проверка', complete: 'Проверка завершена' };
+  const badge = $('#analysisState');
+  if (badge) {
+    const dot = badge.querySelector('.status-dot');
+    badge.replaceChildren();
+    if (dot) badge.append(dot, document.createTextNode(` ${labels[state]}`));
+    else badge.textContent = labels[state];
+  }
+  const activeIndex = state === 'idle' ? 0 : state === 'complete' ? 2 : 1;
+  ['#stepUpload', '#stepAnalyze', '#stepResult'].forEach((selector, index) => {
+    const step = $(selector);
+    if (!step) return;
+    step.classList.toggle('is-active', index === activeIndex);
+    step.classList.toggle('is-complete', index < activeIndex);
+    if (index === activeIndex) step.setAttribute('aria-current', 'step');
+    else step.removeAttribute('aria-current');
+  });
+}
+
+function showError(message) {
+  const error = $('#uploadError');
+  if (error) {
+    error.textContent = message;
+    error.hidden = false;
+    error.tabIndex = -1;
+    window.requestAnimationFrame(() => {
+      if (error.hidden) return;
+      error.focus({ preventScroll: true });
+      error.scrollIntoView({ block: 'center', behavior: motionBehavior() });
+    });
+  }
+  fileInput.setAttribute('aria-invalid', 'true');
+}
+
+function clearError() {
+  const error = $('#uploadError');
+  if (error) {
+    error.hidden = true;
+    error.textContent = '';
+  }
+  fileInput.removeAttribute('aria-invalid');
+}
+
+function setBusy(busy) {
+  isAnalyzing = busy;
+  [fileInput, ...imagePickButtons, $('#removeButton'), $('#newCheck'), remoteToggle].forEach((element) => {
+    if (element) element.disabled = busy;
+  });
+  imagePickButtons.forEach((button) => button.setAttribute('aria-disabled', String(busy)));
+  analyzeButton.disabled = busy || !selectedFile;
+  analyzeButton.classList.toggle('is-busy', busy);
+  analyzeButton.setAttribute('aria-busy', String(busy));
+  dropzone.setAttribute('aria-disabled', String(busy));
+  dropzone.setAttribute('aria-busy', String(busy));
+  dropzone.tabIndex = busy ? -1 : 0;
+  dropzone.classList.toggle('scanning', busy);
+  dropzone.classList.remove('dragging');
+  results.setAttribute('aria-busy', String(busy));
+  const status = $('#analyzeStatus');
+  if (status) status.hidden = !busy;
+  dragDepth = 0;
+}
+
+function clearReport() {
+  results.hidden = true;
+  $('#reportDetails').open = false;
+  ['#breakdownGrid', '#findings', '#fileFacts', '#metadata', '#apiResults', '#forensicSignals', '#forensicMaps', '#c2paResult', '#exifChecks', '#hashes'].forEach((selector) => {
+    $(selector)?.replaceChildren();
+  });
+  ['#resourceBudget', '#apiConsensus', '#scoreBasis', '#resultSources', '#resultHeadline', '#resultSummary', '#resultLabel'].forEach((selector) => setText(selector, ''));
+  setText('#probabilityValue', '—');
+  $('#probabilityFill').style.width = '0%';
+  if ($('#probabilityMarker')) $('#probabilityMarker').hidden = true;
+  $('#scoreCard').classList.remove('high', 'mid', 'low', 'preview-unavailable');
+  $('#scoreCard').classList.add('unknown');
+  $('#resultPreview').removeAttribute('src');
+}
+
+function releasePreview() {
+  const oldUrl = previewUrl;
+  previewUrl = null;
+  preview.onload = null;
+  preview.onerror = null;
   preview.removeAttribute('src');
   $('#resultPreview').removeAttribute('src');
+  if (oldUrl) URL.revokeObjectURL(oldUrl);
+}
+
+function reset() {
+  if (isAnalyzing) return;
+  releasePreview();
+  selectedFile = null;
+  previewAvailable = false;
+  fileInput.value = '';
   $('#previewState').hidden = true;
+  $('#previewState').classList.remove('preview-unavailable');
+  const fallback = $('#previewState').querySelector('.preview-fallback');
+  if (fallback) fallback.hidden = true;
   $('#emptyState').hidden = false;
-  analyzeButton.disabled = true;
-  setAnalyzeButtonText('Проверить');
-  dropzone.classList.remove('scanning');
-  results.hidden = true;
+  clearReport();
+  clearError();
+  setBusy(false);
+  setAnalyzeButtonText(initialButtonText);
+  setText('#uploadHint', 'PNG, JPG, WebP, GIF, TIFF или BMP · до 20 МБ');
+  setText('#fileName', '');
+  setText('#fileDimensions', '');
+  setState('idle');
+}
+
+function isSupportedFile(file) {
+  if (!file) return false;
+  const type = (file.type || '').toLowerCase();
+  return supportedTypes.has(type) || ((!type || type === 'application/octet-stream') && supportedExtension.test(file.name || ''));
 }
 
 function chooseFile(file) {
-  if (!file || !file.type.startsWith('image/')) {
-    alert('Выберите изображение PNG, JPG, WEBP, GIF, TIFF или BMP.');
+  if (isAnalyzing || !file) return;
+  fileInput.value = '';
+  if (!isSupportedFile(file)) {
+    showError('Этот формат не поддерживается. Выберите PNG, JPG, WebP, GIF, TIFF или BMP.');
+    return;
+  }
+  if (!file.size) {
+    showError('Файл пустой. Выберите другое изображение.');
     return;
   }
   if (file.size > 20 * 1024 * 1024) {
-    alert('Максимальный размер файла — 20 МБ.');
+    showError('Файл слишком большой. Максимальный размер — 20 МБ.');
     return;
   }
-  analysisVersion += 1;
-  if (preview.src) URL.revokeObjectURL(preview.src);
+  releasePreview();
+  clearReport();
+  clearError();
   selectedFile = file;
-  preview.src = URL.createObjectURL(file);
-  $('#fileBadge').textContent = `${file.name} · ${formatBytes(file.size)}`;
-  $('#previewState').hidden = false;
+  previewAvailable = false;
+  const objectUrl = URL.createObjectURL(file);
+  previewUrl = objectUrl;
+  const previewState = $('#previewState');
+  previewState.hidden = false;
+  previewState.classList.remove('preview-unavailable');
+  const fallback = previewState.querySelector('.preview-fallback');
+  if (fallback) fallback.hidden = true;
+  preview.hidden = false;
   $('#emptyState').hidden = true;
-  analyzeButton.disabled = false;
-  setAnalyzeButtonText('Проверить');
-  dropzone.classList.remove('scanning');
-  results.hidden = true;
+  setText('#fileBadge', `${file.name} · ${formatBytes(file.size)}`);
+  setText('#fileName', file.name);
+  setText('#fileDimensions', formatBytes(file.size));
+  setText('#uploadHint', 'Изображение готово к проверке.');
+  preview.alt = `Предпросмотр: ${file.name}`;
+  preview.onload = () => {
+    if (previewUrl !== objectUrl) return;
+    previewAvailable = true;
+    setText('#fileDimensions', `${preview.naturalWidth} × ${preview.naturalHeight} · ${formatBytes(file.size)}`);
+  };
+  preview.onerror = () => {
+    if (previewUrl !== objectUrl) return;
+    previewAvailable = false;
+    preview.hidden = true;
+    previewState.classList.add('preview-unavailable');
+    setText('#uploadHint', 'Браузер не показывает превью этого файла. Его можно проверить.');
+    let fallback = previewState.querySelector('.preview-fallback');
+    if (!fallback) {
+      fallback = document.createElement('p');
+      fallback.className = 'preview-fallback';
+      fallback.textContent = 'Файл готов к проверке. Предпросмотр недоступен.';
+      previewState.append(fallback);
+    }
+    fallback.hidden = false;
+  };
+  preview.src = objectUrl;
+  setBusy(false);
+  setAnalyzeButtonText(initialButtonText);
+  setState('ready');
+  window.requestAnimationFrame(() => {
+    if (selectedFile !== file || isAnalyzing) return;
+    const checker = $('#checker') || dropzone;
+    const smallScreen = window.matchMedia('(max-width: 760px)').matches;
+    checker.scrollIntoView({ block: smallScreen ? 'end' : 'start', behavior: motionBehavior() });
+  });
+}
+
+function updateRemoteHint() {
+  const hint = !remoteToggle.checked
+    ? 'Только локальная проверка. Изображение не отправляется внешним сервисам.'
+    : configuredProviders === null
+      ? 'Будут использованы только подключённые на сервере сервисы. Изображение будет передано им для проверки.'
+      : configuredProviders === 0
+        ? 'Внешние сервисы не подключены. Доступна локальная проверка.'
+        : `Подключено ${configuredProviders} ${plural(configuredProviders, 'сервис', 'сервиса', 'сервисов')}. Изображение будет отправлено им для проверки.`;
+  setText('#remoteHint', hint);
 }
 
 function renderProviderStatus(providers) {
+  configuredProviders = asArray(providers).filter((provider) => provider.configured && !provider.unavailable).length;
   const root = $('#providerStatus');
-  root.innerHTML = '';
-  providers.forEach((provider) => {
-    const chip = document.createElement('div');
-    chip.className = `provider-chip ${provider.configured ? 'configured' : provider.unavailable ? 'unavailable' : 'missing'}`;
-    const name = document.createElement('b');
-    const state = document.createElement('small');
-    name.textContent = provider.name;
-    state.textContent = provider.configured ? 'ON' : provider.unavailable ? 'NO API' : 'NO KEY';
-    chip.title = provider.unavailable || provider.required_env.join(' + ');
-    chip.append(name, state);
-    root.append(chip);
-  });
+  if (root) root.textContent = configuredProviders ? `Подключено сервисов: ${configuredProviders}` : 'Внешние сервисы не подключены';
+  updateRemoteHint();
 }
 
 function renderOverall(data) {
@@ -78,57 +254,113 @@ function renderOverall(data) {
   const numeric = Number.isFinite(value);
   const tone = !numeric ? 'unknown' : value >= 65 ? 'high' : value <= 35 ? 'low' : 'mid';
   const card = $('#scoreCard');
-  card.className = `score-card ${tone}`;
-  $('#resultPreview').src = preview.src;
+  card.classList.remove('unknown', 'high', 'low', 'mid');
+  card.classList.add(tone);
+  card.classList.toggle('preview-unavailable', !previewAvailable);
+  const resultImage = $('#resultPreview');
+  resultImage.hidden = !previewAvailable;
+  if (previewAvailable && previewUrl) resultImage.src = previewUrl;
+  else resultImage.removeAttribute('src');
   $('#probabilityValue').textContent = numeric ? `${value}%` : '—';
-  $('#probabilityFill').style.width = numeric ? `${value}%` : '0%';
-  $('#resultLabel').textContent = !numeric ? 'Недостаточно данных' : value >= 65 ? 'Высокая вероятность' : value <= 35 ? 'Низкая вероятность' : 'Неоднозначный результат';
-  $('#resultHeadline').textContent = !numeric ? 'Недостаточно данных' : data.headline || 'Анализ завершён';
-  $('#resultSummary').textContent = numeric
-    ? `Итоговая оценка: ${value}%. Она собрана из доступных модельных ответов и подтверждённых признаков происхождения.`
-    : 'Вероятностные модели не ответили. Отсутствие метаданных само по себе ничего не доказывает.';
+  $('#probabilityFill').style.width = numeric ? `${Math.max(0, Math.min(100, value))}%` : '0%';
+  const marker = $('#probabilityMarker');
+  if (marker) {
+    marker.hidden = !numeric;
+    marker.style.left = numeric ? `${Math.max(0, Math.min(100, value))}%` : '0%';
+  }
+  setText('#resultEyebrow', 'Результат анализа');
+  $('#resultLabel').textContent = !numeric ? 'Недостаточно данных' : value >= 65 ? 'Высокая вероятность ИИ' : value <= 35 ? 'Низкая вероятность ИИ' : 'Неоднозначный результат';
+  const disagreement = probability.label === 'Низкая согласованность';
+  $('#resultHeadline').textContent = !numeric
+    ? 'Не удалось получить оценку'
+    : disagreement
+      ? 'Источники расходятся во мнениях'
+      : value >= 65
+        ? 'Есть признаки генерации ИИ'
+        : value <= 35
+          ? 'Мало признаков генерации ИИ'
+          : 'Однозначного ответа пока нет';
+  $('#resultSummary').textContent = !numeric
+    ? 'Модели не ответили. Попробуйте проверить изображение ещё раз.'
+    : disagreement
+      ? 'Источники расходятся — посмотрите разбивку ниже.'
+      : value >= 65
+        ? 'Найдены признаки генерации или обработки изображения нейросетью.'
+        : value <= 35
+          ? 'Выраженных признаков генерации не обнаружено.'
+          : 'Часть сигналов указывает на ИИ, часть — нет.';
+  const items = asArray(data.api_results);
+  const modelAnswers = items.filter((item) => item.status === 'ok' && !item.provenance && item.verdict !== 'unknown' && Number.isFinite(item.score)).length;
+  const provenanceChecks = items.filter((item) => item.status === 'ok' && item.provenance).length;
+  const sources = [modelAnswers ? `${plural(modelAnswers, 'Ответила', 'Ответили', 'Ответили')} ${modelAnswers} ${plural(modelAnswers, 'модель', 'модели', 'моделей')}` : 'Нет ответивших моделей'];
+  if (provenanceChecks) sources.push(provenanceChecks === 1 ? 'Проверка происхождения выполнена' : `Проверок происхождения выполнено: ${provenanceChecks}`);
+  if (Number.isFinite(probability.sources) && probability.sources > modelAnswers) sources.push('учтён сигнал происхождения');
+  if (numeric && probability.label) sources.push(probability.label === 'Один модельный сигнал' && modelAnswers === 0 ? 'Один сигнал происхождения' : probability.label);
+  setText('#resultSources', sources.join(' · '));
   $('#scoreBasis').textContent = probability.detail || 'Источники оценки отсутствуют.';
+}
+
+function missingMetricState(item, data) {
+  const providerResults = asArray(data.api_results);
+  if (item.id === 'model') {
+    const model = providerResults.find((entry) => entry.id === 'local_frontier') || data.local_model;
+    return { label: model?.status === 'error' ? 'Нет ответа' : 'Недоступна', note: model?.status === 'error' ? 'Локальная модель не смогла завершить проверку.' : 'Локальная модель недоступна для этой проверки.' };
+  }
+  if (item.id === 'semantic' || item.id === 'external') {
+    if (!lastRemoteEnabled) return { label: item.id === 'external' ? 'Отключены' : 'Отключён', note: 'Внешний анализ отключён для этой проверки.' };
+    const providers = providerResults.filter((entry) => item.id === 'semantic' ? entry.id === 'openai_vision' : !entry.provenance && entry.id !== 'synthid' && entry.id !== 'local_frontier' && entry.id !== 'openai_vision');
+    if (providers.some((entry) => entry.status === 'error')) return { label: 'Нет ответа', note: 'Сервис не смог завершить проверку. Подробности — в отчёте.' };
+    if (providers.some((entry) => entry.status === 'ok')) return { label: 'Нет оценки', note: 'Сервис ответил, но не смог определить вероятность.' };
+    return { label: item.id === 'external' ? 'Не подключены' : 'Не подключён', note: item.id === 'external' ? 'Специализированные детекторы не подключены на сервере.' : 'Сервис смыслового анализа не подключён на сервере.' };
+  }
+  return { label: 'Нет данных', note: item.detail || 'Этот сигнал не удалось рассчитать.' };
 }
 
 function renderBreakdown(data) {
   const root = $('#breakdownGrid');
-  root.innerHTML = '';
-  (data.probability_breakdown || []).forEach((item) => {
+  const titles = { model: 'Визуальная модель', semantic: 'Смысловой анализ', external: 'Внешние детекторы', provenance: 'Происхождение', pixels: 'Пиксельный анализ' };
+  const notes = { model: 'Поиск визуальных признаков генерации.', semantic: 'Проверка анатомии, деталей и логики сцены.', external: 'Оценки подключённых детекторов.', provenance: 'Цифровые подписи, метаданные и водяные знаки.', pixels: 'Шум, сжатие и повторяющиеся структуры.' };
+  root.replaceChildren();
+  asArray(data.probability_breakdown).forEach((item, index) => {
     const numeric = Number.isFinite(item.percent);
     const tone = !numeric ? 'missing' : item.percent >= 65 ? 'high' : item.percent >= 36 ? 'mid' : 'low';
+    const missing = numeric ? null : missingMetricState(item, data);
     const card = document.createElement('div');
     card.className = `metric ${tone}`;
-    card.title = item.detail;
-    card.innerHTML = '<div class="metric-main"><span></span><strong></strong></div><div class="metric-bar"><span></span></div>';
-    card.querySelector('.metric-main span').textContent = item.title;
+    card.innerHTML = '<span class="metric-index" aria-hidden="true"></span><div class="metric-main"><span class="metric-title"></span><strong></strong></div><p class="metric-note"></p><div class="metric-bar" aria-hidden="true"><span></span></div>';
+    card.querySelector('.metric-index').textContent = String(index + 1).padStart(2, '0');
+    card.querySelector('.metric-title').textContent = titles[item.id] || item.title || 'Источник сигнала';
     const number = card.querySelector('strong');
-    number.textContent = numeric ? `${item.percent}%` : '—';
-    if (!numeric) number.classList.add('missing');
-    card.querySelector('.metric-bar span').style.width = numeric ? `${item.percent}%` : '0%';
+    number.textContent = numeric ? `${item.percent}%` : missing.label;
+    number.classList.toggle('missing', !numeric);
+    const note = numeric
+      ? item.id === 'provenance' && item.percent === 0 ? 'Метки генерации не найдены.' : notes[item.id] || item.detail || ''
+      : missing.note;
+    card.querySelector('.metric-note').textContent = note;
+    card.querySelector('.metric-bar span').style.width = numeric ? `${Math.max(0, Math.min(100, item.percent))}%` : '0%';
     root.append(card);
   });
 }
 
 function renderFileReport(data) {
   const findings = $('#findings');
-  findings.innerHTML = '';
-  const findingItems = data.findings || [];
+  findings.replaceChildren();
+  const findingItems = asArray(data.findings);
   if (!findingItems.length) {
-    findings.innerHTML = '<p class="empty-copy">AI-специфичные метаданные, C2PA-указание и видимый бейдж не найдены. Модельные результаты показаны отдельно ниже.</p>';
-  } else {
-    findingItems.forEach((item) => {
-      const row = document.createElement('div');
-      row.className = `finding ${item.level}`;
-      row.innerHTML = '<span class="finding-dot"></span><div><b></b><p></p></div>';
-      row.querySelector('b').textContent = item.title;
-      row.querySelector('p').textContent = item.detail;
-      findings.append(row);
-    });
+    findings.innerHTML = '<p class="empty-copy">Сигнатуры генераторов в метаданных не найдены.</p>';
   }
-
-  const facts = [['Формат', data.format], ['Разрешение', `${data.width} × ${data.height}`], ['Размер файла', formatBytes(data.size_bytes)], ['Цветовой режим', data.mode]];
+  findingItems.forEach((item) => {
+    const row = document.createElement('div');
+    row.className = `finding ${item.level || ''}`;
+    row.innerHTML = '<span class="finding-dot"></span><div><b></b><p></p></div>';
+    row.querySelector('b').textContent = item.title || '';
+    row.querySelector('p').textContent = item.detail || '';
+    findings.append(row);
+  });
+  const dimensions = Number.isFinite(data.width) && Number.isFinite(data.height) ? `${data.width} × ${data.height}` : '—';
+  const facts = [['Формат', data.format || '—'], ['Разрешение', dimensions], ['Размер файла', formatBytes(data.size_bytes)], ['Цветовой режим', data.mode || '—']];
   const factsRoot = $('#fileFacts');
-  factsRoot.innerHTML = '';
+  factsRoot.replaceChildren();
   facts.forEach(([key, value]) => {
     const fact = document.createElement('div');
     fact.className = 'fact';
@@ -137,10 +369,9 @@ function renderFileReport(data) {
     fact.querySelector('b').textContent = value;
     factsRoot.append(fact);
   });
-
   const metadata = $('#metadata');
-  metadata.innerHTML = '';
-  const metadataItems = data.metadata || [];
+  metadata.replaceChildren();
+  const metadataItems = asArray(data.metadata);
   if (!metadataItems.length) metadata.textContent = 'Метаданные отсутствуют или были очищены.';
   metadataItems.forEach((item) => {
     const row = document.createElement('div');
@@ -151,29 +382,45 @@ function renderFileReport(data) {
 
 function renderApiResults(data) {
   const root = $('#apiResults');
-  const items = data.api_results || [];
-  root.innerHTML = '';
-  $('#apiConsensus').textContent = data.api_summary?.checked ? `Ответили источников: ${data.api_summary.checked}; ошибок: ${data.api_summary.failed}` : 'Нет ответов моделей и сервисов';
+  const items = asArray(data.api_results);
+  root.replaceChildren();
+  const checked = Number.isFinite(data.api_summary?.checked) ? data.api_summary.checked : items.filter((item) => item.status === 'ok').length;
+  $('#apiConsensus').textContent = checked ? `${checked} ${plural(checked, 'источник ответил', 'источника ответили', 'источников ответили')}` : 'Ответов источников нет';
   if (!items.length) {
-    root.innerHTML = '<div class="api-result"><h4>Внешние API отключены</h4><p>Для этого запуска файл остался локально.</p></div>';
-    return;
+    const empty = document.createElement('p');
+    empty.className = 'empty-copy';
+    empty.textContent = lastRemoteEnabled ? 'Модельные результаты недоступны.' : 'Внешний анализ отключён для этой проверки.';
+    root.append(empty);
   }
   items.forEach((item) => {
     const card = document.createElement('article');
-    const verdict = item.verdict || item.status;
-    card.className = `api-result ${item.status} ${verdict}`;
-    let label = item.status === 'ok' ? item.verdict === 'ai' ? 'AI' : item.verdict === 'unknown' ? 'UNKNOWN' : 'HUMAN' : item.status === 'error' ? 'ERROR' : item.status === 'unavailable' ? 'НЕДОСТУПЕН' : item.status === 'unsupported' ? 'ФОРМАТ' : 'NO KEY';
-    if (item.provenance && item.status === 'ok') label = item.verdict === 'ai' ? 'НАЙДЕНО' : 'НЕ НАЙДЕНО';
+    card.className = `api-result ${item.status || 'unknown'} ${item.verdict || ''}`;
+    if (item.provenance) card.classList.add('provenance');
+    const states = { error: 'Ошибка проверки', unavailable: 'Недоступен', not_configured: 'Не подключён', disabled: 'Отключён', unsupported: 'Формат не поддержан' };
+    const label = item.status === 'ok'
+      ? item.provenance ? item.verdict === 'ai' ? 'Найдено' : 'Не найдено' : item.verdict === 'ai' ? 'Вероятно ИИ' : item.verdict === 'human' ? 'Ниже порога' : 'Неопределённо'
+      : states[item.status] || 'Нет ответа';
     card.innerHTML = '<div class="api-result-top"><h4></h4><span class="status"></span></div><div class="api-score"></div><p></p>';
-    card.querySelector('h4').textContent = item.name;
+    card.querySelector('h4').textContent = item.name || 'Источник сигнала';
     card.querySelector('.status').textContent = label;
     card.querySelector('.api-score').textContent = item.provenance && item.status === 'ok'
       ? item.verdict === 'ai' ? 'Признак найден' : 'Не обнаружено'
-      : item.status === 'ok' && Number.isFinite(item.score) ? `${Math.round(item.score * 100)}%` : '-';
-    card.querySelector('p').textContent = item.detail || '';
-    (item.checks || []).forEach((check) => {
-      const metadata = [check.validation_state, check.issuer, check.model, check.generated_at].filter(Boolean);
-      if (metadata.length) appendDetail(card, check.type === 'synthid' ? 'SynthID' : 'C2PA', metadata.join('; '));
+      : item.status === 'ok' && Number.isFinite(item.score) ? `${Math.round(item.score * 100)}%` : '—';
+    card.querySelector('p').textContent = item.status === 'not_configured' ? 'Этот сервис не подключён на сервере.' : item.detail || '';
+    asArray(item.checks).forEach((check) => {
+      const checkRoot = document.createElement('div');
+      checkRoot.className = 'provenance-check';
+      const type = check.type === 'synthid' ? 'SynthID' : check.type === 'c2pa' ? 'C2PA' : check.type || 'Происхождение';
+      const outcome = check.outcome === 'detected' ? 'Признак найден' : check.outcome === 'not_detected' ? 'Не обнаружено' : 'Нет результата';
+      appendDetail(checkRoot, type, outcome);
+      if (check.validation_state) {
+        const validationStates = { trusted: 'Доверие подтверждено', valid: 'Подпись действительна', invalid: 'Некорректная подпись', not_present: 'Манифест отсутствует' };
+        appendDetail(checkRoot, 'Проверка подписи', validationStates[check.validation_state] || check.validation_state);
+      }
+      if (check.issuer) appendDetail(checkRoot, 'Издатель', check.issuer);
+      if (check.model) appendDetail(checkRoot, 'Модель', check.model);
+      if (check.generated_at) appendDetail(checkRoot, 'Дата генерации', check.generated_at);
+      card.append(checkRoot);
     });
     if (item.generator) {
       const generator = document.createElement('span');
@@ -190,60 +437,63 @@ function appendDetail(root, label, value) {
   row.className = 'detail-row';
   const name = document.createElement('b');
   name.textContent = `${label}: `;
-  row.append(name, document.createTextNode(value));
+  row.append(name, document.createTextNode(value == null ? '—' : String(value)));
   root.append(row);
 }
 
 function renderForensics(data) {
+  ['#forensicSignals', '#forensicMaps', '#c2paResult', '#exifChecks', '#hashes'].forEach((selector) => $(selector).replaceChildren());
+  setText('#resourceBudget', '');
   const report = data.forensics;
-  if (!report) return;
-  const budget = report.resource_budget;
+  if (!report) {
+    setText('#forensicSignals', 'Пиксельный анализ недоступен для этой проверки.');
+    setText('#c2paResult', 'Данные о происхождении недоступны.');
+    return;
+  }
+  const budget = report.resource_budget || {};
   const ml = data.local_model;
-  const mlBudget = ml?.status === 'ok' ? `ML ${ml.peak_rss_mb} MB / лимит ${ml.memory_limit_mb} MB` : 'ML недоступна';
-  $('#resourceBudget').textContent = `Изображение ≤ ${budget.max_analysis_edge}px · FFT ≤ ${budget.max_fft_edge}px · ${mlBudget}`;
-
+  const budgetParts = [];
+  if (Number.isFinite(budget.max_analysis_edge)) budgetParts.push(`Изображение ≤ ${budget.max_analysis_edge}px`);
+  if (Number.isFinite(budget.max_fft_edge)) budgetParts.push(`FFT ≤ ${budget.max_fft_edge}px`);
+  if (ml?.status === 'ok' && Number.isFinite(ml.peak_rss_mb)) budgetParts.push(`Модель: ${ml.peak_rss_mb} МБ памяти`);
+  $('#resourceBudget').textContent = budgetParts.join(' · ');
   const signals = $('#forensicSignals');
-  signals.innerHTML = '';
-  (report.signals || []).forEach((signal) => {
+  asArray(report.signals).forEach((signal) => {
     const card = document.createElement('article');
-    card.className = `forensic-signal ${signal.status}`;
+    card.className = `forensic-signal ${signal.status || ''}`;
     card.innerHTML = '<div class="forensic-signal-top"><b></b><span class="lamp"></span></div><div class="forensic-value"></div><small></small><p></p>';
-    card.querySelector('b').textContent = signal.name;
-    card.querySelector('.forensic-value').textContent = signal.value;
-    card.querySelector('small').textContent = signal.unit;
-    card.querySelector('p').textContent = signal.detail;
+    card.querySelector('b').textContent = signal.name || '';
+    card.querySelector('.forensic-value').textContent = signal.value ?? '—';
+    card.querySelector('small').textContent = signal.unit || '';
+    card.querySelector('p').textContent = signal.detail || '';
     signals.append(card);
   });
-
   const maps = $('#forensicMaps');
-  maps.innerHTML = '';
-  (report.maps || []).forEach((map) => {
+  asArray(report.maps).filter((map) => typeof map.image === 'string' && map.image.startsWith('data:image/')).forEach((map) => {
     const card = document.createElement('figure');
     card.className = 'forensic-map';
     const image = document.createElement('img');
     image.src = map.image;
-    image.alt = `Карта: ${map.name}`;
+    image.alt = `Диагностическая карта: ${map.name || ''}`;
     image.loading = 'lazy';
-    const label = document.createElement('span');
-    label.textContent = map.name;
+    const label = document.createElement('figcaption');
+    label.textContent = map.name || '';
     card.append(image, label);
     maps.append(card);
   });
-
   const c2pa = $('#c2paResult');
-  c2pa.innerHTML = '';
+  const credentials = report.c2pa || {};
+  const c2paStates = { valid: 'Подпись подтверждена', invalid: 'Некорректная подпись', untrusted: 'Доверие не подтверждено', present: 'Манифест найден', none: 'Манифест не найден', unavailable: 'Проверка недоступна', error: 'Ошибка проверки' };
   const badge = document.createElement('span');
-  badge.className = `c2pa-badge ${report.c2pa.status}`;
-  badge.textContent = report.c2pa.status;
+  badge.className = `c2pa-badge ${credentials.status || 'unavailable'}`;
+  badge.textContent = c2paStates[credentials.status] || 'Нет данных';
   c2pa.append(badge);
-  appendDetail(c2pa, 'Результат', report.c2pa.detail);
-  if (report.c2pa.generator) appendDetail(c2pa, 'Claim generator', report.c2pa.generator);
-
+  if (credentials.detail) appendDetail(c2pa, 'Результат', credentials.detail);
+  if (credentials.generator) appendDetail(c2pa, 'Приложение-источник', credentials.generator);
   const exif = $('#exifChecks');
-  exif.innerHTML = '';
-  (report.exif_checks || []).forEach((check) => appendDetail(exif, check.name, check.detail));
+  asArray(report.exif_checks).forEach((check) => appendDetail(exif, check.name, check.detail));
+  if (!exif.childElementCount) exif.textContent = 'Проверяемые EXIF-данные отсутствуют.';
   const hashes = $('#hashes');
-  hashes.innerHTML = '';
   Object.entries(report.hashes || {}).forEach(([name, value]) => appendDetail(hashes, name, value));
 }
 
@@ -255,53 +505,125 @@ function renderResult(data) {
   renderForensics(data);
   $('#reportDetails').open = false;
   results.hidden = false;
-  results.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  setState('complete');
+  results.focus({ preventScroll: true });
+  results.scrollIntoView({ behavior: motionBehavior(), block: 'start' });
+}
+
+function startStageMessages(remote) {
+  const stages = remote && configuredProviders !== 0
+    ? ['Изучаем изображение и его метаданные…', 'Проверяем локальные и подключённые источники…', 'Ожидаем результаты анализа…']
+    : ['Изучаем изображение и его метаданные…', 'Проверяем локальную модель и пиксельные сигналы…', 'Ожидаем результаты локального анализа…'];
+  let stage = 0;
+  setText('#analysisStage', stages[stage]);
+  stageTimer = window.setInterval(() => {
+    stage = Math.min(stage + 1, stages.length - 1);
+    setText('#analysisStage', stages[stage]);
+  }, 4500);
 }
 
 async function analyze() {
-  if (!selectedFile) return;
-  const requestVersion = ++analysisVersion;
-  analyzeButton.disabled = true;
-  setAnalyzeButtonText('Анализируем…');
-  dropzone.classList.add('scanning');
+  if (!selectedFile || isAnalyzing) return;
+  const file = selectedFile;
+  lastRemoteEnabled = remoteToggle.checked;
+  clearError();
+  clearReport();
+  setBusy(true);
+  setState('analyzing');
+  setAnalyzeButtonText('Проверяем изображение…');
+  setText('#uploadHint', 'Проверка выполняется. Это может занять до минуты.');
+  startStageMessages(lastRemoteEnabled);
+  let completed = false;
+  const controller = new AbortController();
+  const requestTimeout = window.setTimeout(() => controller.abort(), 120000);
   try {
-    const remote = $('#useRemote').checked;
-    const response = await fetch(`/api/analyze?filename=${encodeURIComponent(selectedFile.name)}&remote=${remote}`, {
+    const response = await fetch(`/api/analyze?filename=${encodeURIComponent(file.name)}&remote=${lastRemoteEnabled}`, {
       method: 'POST',
-      headers: { 'Content-Type': selectedFile.type || 'application/octet-stream' },
-      body: selectedFile,
+      headers: { 'Content-Type': file.type || 'application/octet-stream' },
+      body: file,
+      signal: controller.signal,
     });
-    const data = await response.json();
-    if (requestVersion !== analysisVersion) return;
-    if (!response.ok) throw new Error(data.detail || 'Не удалось проверить файл');
-    renderResult(data);
-  } catch (error) {
-    if (requestVersion === analysisVersion) alert(error.message || 'Ошибка проверки');
-  } finally {
-    if (requestVersion === analysisVersion) {
-      analyzeButton.disabled = false;
-      setAnalyzeButtonText('Проверить ещё раз');
-      dropzone.classList.remove('scanning');
+    const data = await response.json().catch(() => null);
+    if (!response.ok) {
+      const detail = typeof data?.detail === 'string' ? data.detail : response.status === 413 ? 'Максимальный размер файла — 20 МБ.' : 'Сервер не смог проверить изображение. Попробуйте ещё раз.';
+      throw new Error(detail);
     }
+    if (!data || typeof data !== 'object' || Array.isArray(data)) throw new Error('Получен некорректный ответ сервера. Повторите проверку.');
+    renderResult(data);
+    completed = true;
+    setText('#uploadHint', 'Проверка завершена. Результат — ниже.');
+  } catch (error) {
+    const message = controller.signal.aborted
+      ? 'Сервер слишком долго не отвечает. Файл сохранён — повторите проверку.'
+      : error instanceof TypeError ? 'Не удалось связаться с сервером. Проверьте соединение и попробуйте ещё раз.' : error.message || 'Не удалось проверить изображение. Попробуйте ещё раз.';
+    showError(message);
+    setState('ready');
+    setText('#uploadHint', 'Файл сохранён. Можно повторить проверку.');
+  } finally {
+    window.clearTimeout(requestTimeout);
+    window.clearInterval(stageTimer);
+    stageTimer = null;
+    setBusy(false);
+    setAnalyzeButtonText(completed ? 'Проверить ещё раз' : 'Повторить проверку');
   }
 }
 
-$('#pickButton').addEventListener('click', (event) => { event.stopPropagation(); fileInput.click(); });
-dropzone.addEventListener('click', (event) => { if (!event.target.closest('button')) fileInput.click(); });
-dropzone.addEventListener('keydown', (event) => { if (event.key === 'Enter' || event.key === ' ') fileInput.click(); });
+imagePickButtons.forEach((button) => button.addEventListener('click', (event) => {
+  event.preventDefault();
+  event.stopPropagation();
+  if (!isAnalyzing) fileInput.click();
+}));
+dropzone.addEventListener('click', (event) => {
+  if (!isAnalyzing && !event.target.closest('button, input, a, label')) fileInput.click();
+});
+dropzone.addEventListener('keydown', (event) => {
+  if (event.target !== dropzone || (event.key !== 'Enter' && event.key !== ' ')) return;
+  event.preventDefault();
+  if (!isAnalyzing) fileInput.click();
+});
 fileInput.addEventListener('change', () => chooseFile(fileInput.files[0]));
-['dragenter', 'dragover'].forEach((name) => dropzone.addEventListener(name, (event) => { event.preventDefault(); dropzone.classList.add('dragging'); }));
-['dragleave', 'drop'].forEach((name) => dropzone.addEventListener(name, (event) => { event.preventDefault(); dropzone.classList.remove('dragging'); }));
-dropzone.addEventListener('drop', (event) => chooseFile(event.dataTransfer.files[0]));
-$('#removeButton').addEventListener('click', (event) => { event.stopPropagation(); reset(); });
-$('#newCheck').addEventListener('click', () => { reset(); window.scrollTo({ top: 0, behavior: 'smooth' }); });
+dropzone.addEventListener('dragenter', (event) => {
+  event.preventDefault();
+  if (isAnalyzing) return;
+  dragDepth += 1;
+  dropzone.classList.add('dragging');
+});
+dropzone.addEventListener('dragover', (event) => {
+  event.preventDefault();
+  if (event.dataTransfer) event.dataTransfer.dropEffect = isAnalyzing ? 'none' : 'copy';
+});
+dropzone.addEventListener('dragleave', (event) => {
+  event.preventDefault();
+  dragDepth = Math.max(0, dragDepth - 1);
+  if (!dragDepth) dropzone.classList.remove('dragging');
+});
+dropzone.addEventListener('drop', (event) => {
+  event.preventDefault();
+  dragDepth = 0;
+  dropzone.classList.remove('dragging');
+  if (!isAnalyzing) chooseFile(event.dataTransfer?.files[0]);
+});
+$('#removeButton').addEventListener('click', (event) => {
+  event.stopPropagation();
+  if (isAnalyzing) return;
+  reset();
+  dropzone.focus();
+});
+$('#newCheck').addEventListener('click', () => {
+  if (isAnalyzing) return;
+  reset();
+  dropzone.focus({ preventScroll: true });
+  $('#checker').scrollIntoView({ block: 'start', behavior: motionBehavior() });
+});
 analyzeButton.addEventListener('click', analyze);
+remoteToggle.addEventListener('change', updateRemoteHint);
 
 document.addEventListener('paste', (event) => {
+  if (isAnalyzing || event.target.closest?.('input:not([type="file"]):not([type="checkbox"]):not([type="radio"]):not([type="button"]), textarea, [contenteditable="true"]')) return;
   const clipboard = event.clipboardData;
   if (!clipboard) return;
   const item = Array.from(clipboard.items || []).find((entry) => entry.kind === 'file' && entry.type.startsWith('image/'));
-  const file = item?.getAsFile() || Array.from(clipboard.files || []).find((entry) => entry.type.startsWith('image/'));
+  const file = item?.getAsFile() || Array.from(clipboard.files || []).find((entry) => isSupportedFile(entry));
   if (!file) return;
   event.preventDefault();
   const extension = (file.type.split('/')[1] || 'png').replace('jpeg', 'jpg');
@@ -310,6 +632,15 @@ document.addEventListener('paste', (event) => {
   dropzone.focus();
 });
 
-fetch('/api/providers').then((response) => response.json()).then(renderProviderStatus).catch(() => {
-  $('#providerStatus').innerHTML = '<span class="loading-copy">Не удалось получить конфигурацию API</span>';
-});
+setState('idle');
+updateRemoteHint();
+fetch('/api/providers')
+  .then((response) => {
+    if (!response.ok) throw new Error('Конфигурация недоступна');
+    return response.json();
+  })
+  .then(renderProviderStatus)
+  .catch(() => {
+    setText('#providerStatus', 'Не удалось получить конфигурацию внешних сервисов');
+    updateRemoteHint();
+  });

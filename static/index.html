@@ -3,101 +3,99 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta name="description" content="Проверка изображения на признаки генерации ИИ">
-  <title>AntiSlop</title>
-  <link rel="stylesheet" href="/static/app.css?v=4">
+  <meta name="theme-color" content="#080c10">
+  <meta name="description" content="Фото или нейросеть? Проверьте изображение с помощью AntiSlop: визуальный анализ, цифровые подписи и поиск следов генерации.">
+  <title>AntiSlop — фото или нейросеть?</title>
+  <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+  <link rel="preload" href="/static/fonts/unbounded-cyrillic.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="stylesheet" href="/static/app.css?v=6">
+  <script src="/static/effects.js?v=6" defer></script>
 </head>
-<body>
-  <header><a href="#">AntiSlop</a></header>
-
+<body data-state="idle">
+  <svg class="icon-definitions" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+    <symbol id="icon-arrow" viewBox="0 0 24 24"><path d="M4 12h15m-6-6 6 6-6 6"/></symbol>
+    <symbol id="icon-image" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="3"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="m21 16-5-5L5 21"/></symbol>
+    <symbol id="icon-shield" viewBox="0 0 24 24"><path d="m12 3 8 3v6c0 5-8 9-8 9s-8-4-8-9V6l8-3Z"/><path d="m8 12 3 3 5-6"/></symbol>
+    <symbol id="icon-scan" viewBox="0 0 24 24"><path d="M8 3H3v5m13-5h5v5M3 16v5h5m13-5v5h-5M2 12h20"/></symbol>
+    <symbol id="icon-close" viewBox="0 0 24 24"><path d="m6 6 12 12M6 18 18 6"/></symbol>
+    <symbol id="icon-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+    <symbol id="icon-check" viewBox="0 0 24 24"><path d="m5 12 4 4L19 6"/></symbol>
+  </svg>
+  <a class="skip-link" href="#checker">Перейти к проверке</a>
+  <header class="site-header page-width">
+    <a class="wordmark" href="/" aria-label="AntiSlop — главная"><span class="brand-symbol" aria-hidden="true"><i></i><i></i><i></i><i></i><b></b></span>ANTISLOP</a>
+    <nav aria-label="Основная навигация"><a href="#checker">Проверка</a><a href="#how-it-works">Как это работает</a></nav>
+    <button type="button" class="nav-cta" data-pick-image>Загрузить фото <span aria-hidden="true">↗</span></button>
+  </header>
   <main>
-    <section class="start">
-      <h1>Проверка изображения</h1>
-      <p>Загрузите файл или вставьте его из буфера.</p>
-
-      <div id="dropzone" class="dropzone" tabindex="0" role="button" aria-label="Выбрать изображение">
-        <input id="fileInput" type="file" accept="image/png,image/jpeg,image/webp,image/gif,image/tiff,image/bmp" hidden>
-        <div id="emptyState" class="drop-empty">
-          <span>+</span>
-          <b>Выбрать или перетащить</b>
-          <small>Ctrl/⌘ + V · до 20 МБ</small>
-          <button id="pickButton" type="button">Выбрать файл</button>
-        </div>
-        <div id="previewState" class="preview-state" hidden>
-          <img id="preview" alt="Выбранное изображение">
-          <div id="fileBadge" class="file-badge"></div>
-          <button id="removeButton" class="remove-button" type="button" aria-label="Убрать изображение">×</button>
-          <div class="scan-line"></div>
-        </div>
+    <section class="hero" aria-labelledby="pageTitle">
+      <canvas id="heroCanvas" aria-hidden="true"></canvas>
+      <div class="hero-grid" aria-hidden="true"></div>
+      <div class="hero-frame" aria-hidden="true"><i></i><i></i><i></i><i></i><span class="hero-sweep"></span><span class="hero-crosshair"></span></div>
+      <div class="hero-content page-width">
+        <p class="hero-kicker">Проверка изображений на ИИ</p>
+        <h1 id="pageTitle">Фото или<br><span>нейросеть?</span></h1>
+        <p class="hero-description">Загрузите изображение и проверьте его<br class="desktop-break"> на признаки генерации искусственным интеллектом.</p>
+        <div class="hero-actions"><button class="cta-button" type="button" data-pick-image>Проверить изображение <svg class="icon" aria-hidden="true"><use href="#icon-arrow"/></svg></button><a class="hero-how" href="#how-it-works">Как это работает <span aria-hidden="true">↓</span></a></div>
       </div>
-
-      <div class="actions">
-        <label class="remote-toggle">
-          <input id="useRemote" type="checkbox" checked>
-          <span></span>
-          <b>Подключённые API</b>
-        </label>
-        <button id="analyzeButton" class="primary-button" type="button" disabled><span>Проверить</span></button>
-      </div>
-      <div id="providerStatus" hidden></div>
+      <a class="hero-scroll" href="#checker" aria-label="Перейти к загрузке изображения"><span aria-hidden="true"></span><svg class="icon" aria-hidden="true"><use href="#icon-arrow"/></svg></a>
     </section>
 
-    <section id="results" class="results" hidden aria-live="polite">
-      <div class="result-actions"><button id="newCheck" type="button">Другое изображение</button></div>
-
-      <article id="scoreCard" class="score-card unknown">
-        <img id="resultPreview" alt="Проверенное изображение">
-        <div class="score-content">
-          <strong id="probabilityValue">—</strong>
-          <span>Вероятность генерации ИИ</span>
-          <h2 id="resultHeadline"></h2>
-          <p id="resultSummary" hidden></p>
-          <span id="resultLabel" hidden></span>
+    <section id="checker" class="checker-section page-width" aria-labelledby="checkerTitle">
+      <div class="section-heading"><h2 id="checkerTitle">Проверьте изображение<span>.</span></h2><p>Выберите файл или вставьте его из буфера.</p></div>
+      <div class="checker">
+        <div class="checker-heading"><span class="eyebrow">Изображение</span><span id="analysisState" class="state-badge"><span class="status-dot"></span> Ожидает изображение</span></div>
+        <div class="checker-layout">
+          <div class="upload-column">
+            <div id="dropzone" class="dropzone" tabindex="0" role="button" aria-label="Выбрать изображение для проверки" aria-describedby="uploadHint">
+              <input id="fileInput" type="file" accept="image/png,image/jpeg,image/webp,image/gif,image/tiff,image/bmp,.tif,.tiff" hidden>
+              <span class="frame-corner top-left" aria-hidden="true"></span><span class="frame-corner top-right" aria-hidden="true"></span><span class="frame-corner bottom-left" aria-hidden="true"></span><span class="frame-corner bottom-right" aria-hidden="true"></span>
+              <div id="emptyState" class="drop-empty"><div class="upload-icon" aria-hidden="true"><svg class="icon"><use href="#icon-image"/></svg><span>+</span></div><h3>Перетащите изображение</h3><p>или выберите его на устройстве</p><button id="pickButton" class="pick-button" type="button">Выбрать файл <svg class="icon" aria-hidden="true"><use href="#icon-plus"/></svg></button><small><kbd>Ctrl</kbd> + <kbd>V</kbd><span> / ⌘ V</span></small></div>
+              <div id="previewState" class="preview-state" hidden><img id="preview" alt="Выбранное изображение"><div class="preview-fallback"><svg class="icon" aria-hidden="true"><use href="#icon-image"/></svg><b>Файл готов к проверке</b><span>Предпросмотр этого формата недоступен</span></div><div id="fileBadge" class="file-badge"></div><button id="removeButton" class="remove-button" type="button" aria-label="Убрать изображение и выбрать другое"><svg class="icon" aria-hidden="true"><use href="#icon-close"/></svg></button><div class="scan-line" aria-hidden="true"></div></div>
+            </div>
+            <p id="uploadHint" class="upload-hint">JPG, PNG, WebP, GIF, TIFF, BMP · до 20 МБ</p>
+          </div>
+          <div class="checker-controls">
+            <div class="check-symbol" aria-hidden="true"><svg class="icon"><use href="#icon-scan"/></svg></div>
+            <h3>Параметры анализа</h3>
+            <div class="remote-option"><div class="remote-copy"><label for="useRemote">Дополнительные сервисы</label><p id="remoteHint">Подключённые сервисы также получат изображение.</p></div><label class="remote-toggle"><input id="useRemote" type="checkbox" checked aria-describedby="remoteHint"><span class="switch-track" aria-hidden="true"></span><span class="sr-only">Использовать внешние сервисы</span></label></div>
+            <button id="analyzeButton" class="primary-button" type="button" disabled><span>Проверить изображение</span><svg class="icon" aria-hidden="true"><use href="#icon-arrow"/></svg></button>
+            <div id="uploadError" class="upload-error" role="alert" hidden></div>
+            <div id="analyzeStatus" class="analyze-status" role="status" hidden><span class="progress-spinner" aria-hidden="true"></span><span id="analysisStage">Изучаем изображение…</span></div>
+            <div id="providerStatus" hidden></div>
+          </div>
         </div>
-        <div class="score-line"><span id="probabilityFill"></span></div>
+      </div>
+    </section>
+    <section id="results" class="results page-width" hidden aria-label="Результат проверки" aria-live="polite" tabindex="-1">
+      <div class="results-heading"><div><p id="resultEyebrow" class="eyebrow">Проверка завершена</p><h2>Результат проверки</h2></div><button id="newCheck" class="text-button" type="button">Проверить другое<svg class="icon" aria-hidden="true"><use href="#icon-arrow"/></svg></button></div>
+      <article id="scoreCard" class="score-card unknown">
+        <div class="score-content"><span id="resultLabel" class="result-label">Результат проверки</span><div class="probability-number"><strong id="probabilityValue">—</strong><span>вероятность<br>генерации ИИ</span></div><h3 id="resultHeadline"></h3><p id="resultSummary"></p><p id="resultSources" class="result-sources"></p></div>
+        <div class="result-image-wrap"><img id="resultPreview" alt="Проверенное изображение"></div>
+        <div class="score-scale"><div class="score-line"><span id="probabilityFill"></span><i id="probabilityMarker" aria-hidden="true"></i></div><div class="scale-labels"><span>Меньше признаков ИИ</span><span>Больше признаков ИИ</span></div></div>
       </article>
-
-      <section class="breakdown">
-        <h2>Разбивка</h2>
-        <div id="breakdownGrid"></div>
-      </section>
-
+      <section class="breakdown" aria-labelledby="breakdownTitle"><div class="breakdown-heading"><h3 id="breakdownTitle">Что показала проверка</h3></div><div id="breakdownGrid"></div></section>
       <details id="reportDetails" class="report">
-        <summary>Подробный отчёт <span>+</span></summary>
+        <summary><span class="report-summary-copy"><svg class="icon" aria-hidden="true"><use href="#icon-scan"/></svg><span>Посмотреть подробный отчёт<small>Источники, метаданные и карты анализа</small></span></span><span class="report-plus" aria-hidden="true">+</span></summary>
         <div class="report-body">
           <p id="scoreBasis" class="score-basis"></p>
-
-          <div class="report-grid">
-            <section><h3>Найденные признаки</h3><div id="findings"></div></section>
-            <section>
-              <h3>Файл</h3>
-              <div id="fileFacts" class="file-facts"></div>
-              <details class="metadata-details"><summary>Метаданные</summary><div id="metadata" class="metadata"></div></details>
-            </section>
-          </div>
-
-          <section class="report-section">
-            <div class="report-heading"><h3>Модели и сервисы</h3><span id="apiConsensus"></span></div>
-            <div id="apiResults" class="api-results"></div>
-          </section>
-
-          <section class="report-section">
-            <div class="report-heading"><h3>Пиксельный анализ</h3><span id="resourceBudget"></span></div>
-            <div id="forensicSignals" class="forensic-signals"></div>
-            <div id="forensicMaps" class="forensic-maps"></div>
-            <div class="forensic-details">
-              <div><h4>C2PA</h4><div id="c2paResult"></div></div>
-              <div><h4>EXIF</h4><div id="exifChecks"></div></div>
-              <div><h4>Хеши</h4><div id="hashes"></div></div>
-            </div>
-          </section>
+          <div class="report-grid"><section><h3>Найденные признаки</h3><div id="findings"></div></section><section><h3>Файл</h3><div id="fileFacts" class="file-facts"></div><details class="metadata-details"><summary>Метаданные</summary><div id="metadata" class="metadata"></div></details></section></div>
+          <section class="report-section"><div class="report-heading"><h3>Модели и сервисы</h3><span id="apiConsensus"></span></div><div id="apiResults" class="api-results"></div></section>
+          <section class="report-section"><div class="report-heading"><h3>Пиксельный анализ</h3><span id="resourceBudget"></span></div><div id="forensicSignals" class="forensic-signals"></div><div id="forensicMaps" class="forensic-maps"></div><div class="forensic-details"><div><h4>C2PA</h4><div id="c2paResult"></div></div><div><h4>EXIF</h4><div id="exifChecks"></div></div><div><h4>Хеши</h4><div id="hashes"></div></div></div></section>
         </div>
       </details>
+    </section>
 
-      <p class="disclaimer">Оценка может ошибаться и не является доказательством происхождения.</p>
+    <section id="how-it-works" class="methods page-width" aria-labelledby="methodsTitle">
+      <div class="section-heading"><h2 id="methodsTitle">Что внутри проверки<span>?</span></h2><p>Несколько методов работают с одним изображением.</p></div>
+      <div class="method-list">
+        <article><span class="method-number" aria-hidden="true">01</span><svg class="icon" aria-hidden="true"><use href="#icon-image"/></svg><h3>Визуальный анализ</h3><p>Модели ищут следы генерации в деталях, текстурах и содержимом изображения.</p></article>
+        <article><span class="method-number" aria-hidden="true">02</span><svg class="icon" aria-hidden="true"><use href="#icon-shield"/></svg><h3>Происхождение</h3><p>Проверяются метаданные, цифровые подписи C2PA и доступные водяные знаки.</p></article>
+        <article><span class="method-number" aria-hidden="true">03</span><svg class="icon" aria-hidden="true"><use href="#icon-scan"/></svg><h3>Пиксельный анализ</h3><p>Шум, сжатие, частотный спектр и повторяющиеся структуры дополняют картину.</p></article>
+      </div>
     </section>
   </main>
-
-  <script src="/static/app.js?v=4"></script>
+  <footer class="site-footer page-width"><a class="footer-brand" href="/">ANTISLOP</a><a href="#checker">Проверить изображение <span aria-hidden="true">↗</span></a><span>© 2026</span></footer>
+  <script src="/static/app.js?v=6"></script>
 </body>
 </html>
